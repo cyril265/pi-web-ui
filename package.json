@@ -1,0 +1,21 @@
+{
+  "name": "pi-web-app",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "shared",
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "node ./scripts/dev.mjs",
+    "dev:server": "npm run dev --workspace @pi-web-app/server",
+    "dev:client": "npm run dev --workspace @pi-web-app/client",
+    "build": "npm run build --workspace @pi-web-app/shared && npm run build --workspace @pi-web-app/client && npm run build --workspace @pi-web-app/server",
+    "check": "npm run build --workspace @pi-web-app/shared && npm run check --workspace @pi-web-app/client && npm run check --workspace @pi-web-app/server",
+    "start": "npm run start --workspace @pi-web-app/server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
