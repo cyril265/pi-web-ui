@@ -230,13 +230,7 @@ async function sendComposer() {
     }
   } catch (error) {
     state.composerText = submittedText;
-    state.attachments = submittedAttachments.map((a) => ({
-      id: a.id,
-      fileName: a.fileName,
-      mimeType: a.mimeType,
-      preview: a.preview,
-      data: a.data,
-    }));
+    state.attachments = submittedAttachments;
     state.error = getErrorMessage(error);
     renderApp();
   }
