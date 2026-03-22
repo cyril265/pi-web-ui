@@ -1,4 +1,5 @@
 import { html, render, nothing } from "lit";
+import { live } from "lit/directives/live.js";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import { marked } from "marked";
 import type {
@@ -219,12 +220,25 @@ async function sendComposer() {
 
   const sessionId = state.activeSession.sessionId;
 
-  if (state.composerMode === "prompt") {
-    await apiPost(`/api/sessions/${sessionId}/prompt`, body);
-  } else if (state.composerMode === "steer") {
-    await apiPost(`/api/sessions/${sessionId}/steer`, { message: submittedText });
-  } else {
-    await apiPost(`/api/sessions/${sessionId}/follow-up`, { message: submittedText });
+  try {
+    if (state.composerMode === "prompt") {
+      await apiPost(`/api/sessions/${sessionId}/prompt`, body);
+    } else if (state.composerMode === "steer") {
+      await apiPost(`/api/sessions/${sessionId}/steer`, { message: submittedText });
+    } else {
+      await apiPost(`/api/sessions/${sessionId}/follow-up`, { message: submittedText });
+    }
+  } catch (error) {
+    state.composerText = submittedText;
+    state.attachments = submittedAttachments.map((a) => ({
+      id: a.id,
+      fileName: a.fileName,
+      mimeType: a.mimeType,
+      preview: a.preview,
+      data: a.data,
+    }));
+    state.error = getErrorMessage(error);
+    renderApp();
   }
 }
 
@@ -1125,7 +1139,7 @@ const template = () => html`
             class="pp-composer-input"
             rows="1"
             placeholder=${getComposerPlaceholder(state.composerMode)}
-            .value=${state.composerText}
+            .value=${live(state.composerText)}
             @input=${(e: Event) => { state.composerText = (e.target as HTMLTextAreaElement).value; }}
             @keydown=${(e: KeyboardEvent) => {
               if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendComposer(); }
@@ -1133,11 +1147,16 @@ const template = () => html`
           ></textarea>
           ${state.activeSession?.status === "streaming"
             ? html`<button
-                style="background:none;border:none;color:var(--pp-error-text);cursor:pointer;font-size:1rem;flex-shrink:0;"
+                class="pp-composer-btn"
+                style="color:var(--pp-error-text);"
                 @click=${abortRun}
                 title="Stop"
               >\u25a0</button>`
-            : nothing}
+            : html`<button
+                class="pp-composer-btn"
+                @click=${() => void sendComposer()}
+                title="Send"
+              >\u27a4</button>`}
         </div>
 
         ${renderExtensionWidgets("belowEditor")}
