@@ -49,6 +49,13 @@ type AssistantMessagePart =
   | { type: "markdown"; text: string }
   | { type: "toolCall"; toolCall: ParsedToolCallMessage };
 type LiveConnectionState = "disconnected" | "connecting" | "connected" | "reconnecting";
+type ApiRequestOptions = {
+  signal?: AbortSignal;
+};
+type SessionSelection = {
+  token: number;
+  signal: AbortSignal;
+};
 
 type AppState = {
   sessions: ApiSessionListItem[];
@@ -135,8 +142,11 @@ const state: AppState = {
 };
 
 let currentEvents: EventSource | undefined;
+let currentSessionSelection = 0;
+let currentSessionSelectionController = new AbortController();
 let eventReconnectTimeout: ReturnType<typeof setTimeout> | undefined;
 let eventReconnectAttempts = 0;
+let sessionsLoadRequestId = 0;
 const levels: ThinkingLevel[] = ["off", "low", "medium", "high"];
 let messagesContainer: HTMLElement | null = null;
 const EVENT_RECONNECT_BASE_DELAY_MS = 1_000;
@@ -152,15 +162,25 @@ async function bootstrap() {
   applyTheme();
   try {
     await Promise.all([loadSessions(), loadModels()]);
-    if (state.sessions[0]?.live) {
-      await attachToLiveSession(state.sessions[0].id);
-    } else if (state.sessions[0]?.sessionFile) {
-      await openSession(state.sessions[0].sessionFile);
+    const firstSession = state.sessions[0];
+    if (firstSession?.live) {
+      try {
+        await attachToLiveSession(firstSession.id);
+      } catch (error) {
+        if (isAbortError(error) || !firstSession.sessionFile || !isSessionNotFoundError(error)) {
+          throw error;
+        }
+        await openSession(firstSession.sessionFile);
+      }
+    } else if (firstSession?.sessionFile) {
+      await openSession(firstSession.sessionFile);
     } else {
       await createSession();
     }
   } catch (error) {
-    setError(getErrorMessage(error));
+    if (!isAbortError(error)) {
+      setError(getErrorMessage(error));
+    }
   } finally {
     state.isLoading = false;
     renderApp();
@@ -169,7 +189,11 @@ async function bootstrap() {
 
 async function loadSessions(scope = state.sessionsScope) {
   state.sessionsScope = scope;
+  const requestId = ++sessionsLoadRequestId;
   const response = await apiGet<{ sessions: ApiSessionListItem[] }>(`/api/sessions?scope=${scope}`);
+  if (requestId !== sessionsLoadRequestId || scope !== state.sessionsScope) {
+    return;
+  }
   state.sessions = response.sessions;
   renderApp();
 }
@@ -186,10 +210,67 @@ function refreshSessionsInBackground(scope = state.sessionsScope) {
   });
 }
 
+function disconnectCurrentEvents() {
+  clearEventReconnectTimer();
+  const previousEvents = currentEvents;
+  currentEvents = undefined;
+  previousEvents?.close();
+}
+
+function beginSessionSelection(): SessionSelection {
+  currentSessionSelection += 1;
+  currentSessionSelectionController.abort();
+  currentSessionSelectionController = new AbortController();
+  disconnectCurrentEvents();
+  if (state.activeSession) {
+    state.liveConnectionState = "connecting";
+  }
+  return {
+    token: currentSessionSelection,
+    signal: currentSessionSelectionController.signal,
+  };
+}
+
+function isCurrentSessionSelection(token: number) {
+  return token === currentSessionSelection;
+}
+
+async function loadAndOpenSnapshot(
+  loadSnapshot: (signal: AbortSignal) => Promise<ApiSessionSnapshot>,
+  options: { refreshSessions?: boolean } = {},
+) {
+  const previousSession = state.activeSession;
+  const selection = beginSessionSelection();
+  try {
+    const snapshot = await loadSnapshot(selection.signal);
+    const opened = openSnapshot(snapshot, selection.token);
+    if (opened && options.refreshSessions) {
+      refreshSessionsInBackground();
+    }
+    return opened;
+  } catch (error) {
+    if (
+      !isAbortError(error) &&
+      previousSession &&
+      isCurrentSessionSelection(selection.token) &&
+      state.activeSession?.sessionId === previousSession.sessionId
+    ) {
+      state.liveConnectionState = "connecting";
+      connectEvents(previousSession.sessionId);
+      renderApp();
+    }
+    throw error;
+  }
+}
+
 async function createSession() {
-  const response = await apiPost<{ snapshot: ApiSessionSnapshot }>("/api/sessions", {});
-  openSnapshot(response.snapshot);
-  refreshSessionsInBackground();
+  return await loadAndOpenSnapshot(
+    async (signal) => {
+      const response = await apiPost<{ snapshot: ApiSessionSnapshot }>("/api/sessions", {}, { signal });
+      return response.snapshot;
+    },
+    { refreshSessions: true },
+  );
 }
 
 async function handleCreateSession() {
@@ -198,14 +279,24 @@ async function handleCreateSession() {
 }
 
 async function openSession(sessionFile: string) {
-  const response = await apiPost<{ snapshot: ApiSessionSnapshot }>("/api/sessions/open", { path: sessionFile });
-  openSnapshot(response.snapshot);
-  refreshSessionsInBackground();
+  return await loadAndOpenSnapshot(
+    async (signal) => {
+      const response = await apiPost<{ snapshot: ApiSessionSnapshot }>(
+        "/api/sessions/open",
+        { path: sessionFile },
+        { signal },
+      );
+      return response.snapshot;
+    },
+    { refreshSessions: true },
+  );
 }
 
 async function attachToLiveSession(sessionId: string) {
-  const response = await apiGet<{ snapshot: ApiSessionSnapshot }>(`/api/sessions/${sessionId}`);
-  openSnapshot(response.snapshot);
+  return await loadAndOpenSnapshot(async (signal) => {
+    const response = await apiGet<{ snapshot: ApiSessionSnapshot }>(`/api/sessions/${sessionId}`, { signal });
+    return response.snapshot;
+  });
 }
 
 async function sendComposer() {
@@ -299,6 +390,7 @@ async function setThinkingLevel(level: ThinkingLevel) {
 
 async function openActions() {
   if (!state.activeSession) return;
+  const sessionId = state.activeSession.sessionId;
   state.showActions = true;
   state.showMenu = false;
   state.renameText = state.activeSession.title;
@@ -310,28 +402,38 @@ async function openActions() {
 
   try {
     const [forkResponse, treeResponse] = await Promise.all([
-      apiGet<{ messages: ApiForkMessage[] }>(`/api/sessions/${state.activeSession.sessionId}/fork-messages`),
-      apiGet<{ messages: ApiTreeMessage[] }>(`/api/sessions/${state.activeSession.sessionId}/tree-messages`),
+      apiGet<{ messages: ApiForkMessage[] }>(`/api/sessions/${sessionId}/fork-messages`),
+      apiGet<{ messages: ApiTreeMessage[] }>(`/api/sessions/${sessionId}/tree-messages`),
     ]);
+    if (state.activeSession?.sessionId !== sessionId) return;
     state.forkMessages = forkResponse.messages;
     state.treeMessages = treeResponse.messages;
   } catch (error) {
-    state.error = getErrorMessage(error);
+    if (state.activeSession?.sessionId === sessionId) {
+      state.error = getErrorMessage(error);
+    }
   } finally {
-    state.isLoadingForkMessages = false;
-    state.isLoadingTreeMessages = false;
-    renderApp();
+    if (state.activeSession?.sessionId === sessionId) {
+      state.isLoadingForkMessages = false;
+      state.isLoadingTreeMessages = false;
+      renderApp();
+    }
   }
 }
 
 async function renameSession() {
   if (!state.activeSession) return;
+  const sessionId = state.activeSession.sessionId;
   const name = state.renameText.trim();
   if (!name) return;
   const response = await apiPost<{ snapshot: ApiSessionSnapshot }>(
-    `/api/sessions/${state.activeSession.sessionId}/rename`,
+    `/api/sessions/${sessionId}/rename`,
     { name },
   );
+  if (state.activeSession?.sessionId !== sessionId) {
+    refreshSessionsInBackground();
+    return;
+  }
   openSnapshot(response.snapshot);
   refreshSessionsInBackground();
   state.info = "Session renamed.";
@@ -340,18 +442,25 @@ async function renameSession() {
 
 async function reopenActiveSession() {
   if (!state.activeSession || state.isReopeningSession) return;
+  const sessionId = state.activeSession.sessionId;
   state.isReopeningSession = true;
   renderApp();
   try {
     const response = await apiPost<{ snapshot: ApiSessionSnapshot }>(
-      `/api/sessions/${state.activeSession.sessionId}/reopen`,
+      `/api/sessions/${sessionId}/reopen`,
       {},
     );
+    if (state.activeSession?.sessionId !== sessionId) {
+      refreshSessionsInBackground();
+      return;
+    }
     openSnapshot(response.snapshot);
     refreshSessionsInBackground();
     state.info = "Session reloaded from disk.";
   } catch (error) {
-    state.error = getErrorMessage(error);
+    if (state.activeSession?.sessionId === sessionId) {
+      state.error = getErrorMessage(error);
+    }
   } finally {
     state.isReopeningSession = false;
     renderApp();
@@ -360,11 +469,16 @@ async function reopenActiveSession() {
 
 async function forkFromEntry(entryId: string) {
   if (!state.activeSession) return;
+  const sessionId = state.activeSession.sessionId;
   const response = await apiPost<{ cancelled: boolean; selectedText: string; snapshot: ApiSessionSnapshot }>(
-    `/api/sessions/${state.activeSession.sessionId}/fork`,
+    `/api/sessions/${sessionId}/fork`,
     { entryId },
   );
   if (response.cancelled) return;
+  if (state.activeSession?.sessionId !== sessionId) {
+    refreshSessionsInBackground();
+    return;
+  }
   state.composerText = response.selectedText;
   state.showActions = false;
   openSnapshot(response.snapshot);
@@ -375,11 +489,16 @@ async function forkFromEntry(entryId: string) {
 
 async function navigateTree(entryId: string) {
   if (!state.activeSession) return;
+  const sessionId = state.activeSession.sessionId;
   const response = await apiPost<{ cancelled: boolean; editorText?: string; snapshot: ApiSessionSnapshot }>(
-    `/api/sessions/${state.activeSession.sessionId}/tree`,
+    `/api/sessions/${sessionId}/tree`,
     { entryId },
   );
   if (response.cancelled) return;
+  if (state.activeSession?.sessionId !== sessionId) {
+    refreshSessionsInBackground();
+    return;
+  }
   state.composerText = response.editorText ?? "";
   state.showActions = false;
   openSnapshot(response.snapshot);
@@ -412,52 +531,119 @@ async function handleFiles(files: FileList | null) {
   renderApp();
 }
 
-function openSnapshot(snapshot: ApiSessionSnapshot) {
+function clearRenderedMessageCaches() {
+  assistantMessagePartsCache.clear();
+  markdownHtmlCache.clear();
+}
+
+function getSessionPreviewFromSnapshot(snapshot: ApiSessionSnapshot) {
+  const firstUserMessage = snapshot.messages.find((message) =>
+    message.role === "user" || message.role === "user-with-attachments",
+  );
+  return firstUserMessage?.text ?? "";
+}
+
+function getSnapshotLastModified(snapshot: ApiSessionSnapshot, existing: ApiSessionListItem | undefined) {
+  const timestamps = [
+    snapshot.toolExecutions.at(-1)?.updatedAt,
+    [...snapshot.messages].reverse().find((message) => message.timestamp)?.timestamp,
+    existing?.lastModified,
+    new Date().toISOString(),
+  ].filter((value): value is string => Boolean(value));
+
+  return timestamps.sort().at(-1);
+}
+
+function sortSessionListByLastModified(sessions: ApiSessionListItem[]) {
+  return [...sessions].sort((left, right) => (right.lastModified ?? "").localeCompare(left.lastModified ?? ""));
+}
+
+function syncSessionListItem(snapshot: ApiSessionSnapshot) {
+  const existing = state.sessions.find((session) =>
+    session.id === snapshot.sessionId || (snapshot.sessionFile && session.sessionFile === snapshot.sessionFile),
+  );
+  const nextSession: ApiSessionListItem = {
+    id: snapshot.sessionId,
+    sessionFile: snapshot.sessionFile ?? existing?.sessionFile,
+    cwd: existing?.cwd,
+    isInCurrentWorkspace: existing?.isInCurrentWorkspace ?? true,
+    title: snapshot.title,
+    preview: getSessionPreviewFromSnapshot(snapshot),
+    lastModified: getSnapshotLastModified(snapshot, existing),
+    messageCount: snapshot.messages.length,
+    modelId: snapshot.model?.id,
+    thinkingLevel: snapshot.thinkingLevel,
+    status: snapshot.status,
+    live: true,
+    externallyDirty: snapshot.externallyDirty,
+  };
+  const remainingSessions = state.sessions.filter((session) =>
+    session.id !== snapshot.sessionId && (!snapshot.sessionFile || session.sessionFile !== snapshot.sessionFile),
+  );
+  state.sessions = sortSessionListByLastModified([nextSession, ...remainingSessions]);
+}
+
+function applySnapshot(snapshot: ApiSessionSnapshot, options: { resetSessionUi?: boolean } = {}) {
   const previousSessionId = state.activeSession?.sessionId;
   reconcilePendingComposerSubmissions(snapshot);
   state.activeSession = snapshot;
-  if (previousSessionId !== snapshot.sessionId) {
+  const sessionChanged = previousSessionId !== snapshot.sessionId;
+  if (sessionChanged) {
     state.expandedToolCards = new Set<string>();
+    clearRenderedMessageCaches();
   }
   state.renameText = snapshot.title;
-  state.pendingExtensionUi = undefined;
-  state.extensionUiValue = "";
-  state.extensionStatuses = [];
-  state.extensionWidgets = [];
+  if (options.resetSessionUi) {
+    state.pendingExtensionUi = undefined;
+    state.extensionUiValue = "";
+    state.extensionStatuses = [];
+    state.extensionWidgets = [];
+  }
   state.pageTitle = snapshot.title;
   document.title = state.pageTitle;
-  state.error = undefined;
-  state.isLoading = false;
-  state.switchingSessionId = undefined;
+  syncSessionListItem(snapshot);
+  if (options.resetSessionUi) {
+    state.error = undefined;
+    state.isLoading = false;
+    state.switchingSessionId = undefined;
+  }
+  return sessionChanged;
+}
+
+function openSnapshot(snapshot: ApiSessionSnapshot, selectionToken?: number) {
+  if (selectionToken !== undefined && !isCurrentSessionSelection(selectionToken)) {
+    return false;
+  }
+  applySnapshot(snapshot, { resetSessionUi: true });
   state.liveConnectionState = "connecting";
   connectEvents(snapshot.sessionId);
   renderApp();
   scrollToBottom();
+  return true;
 }
 
 function connectEvents(sessionId: string) {
-  clearEventReconnectTimer();
-  currentEvents?.close();
+  disconnectCurrentEvents();
   const events = new EventSource(`/api/sessions/${sessionId}/events`);
   currentEvents = events;
 
   events.onopen = () => {
-    if (currentEvents !== events) return;
+    if (currentEvents !== events || state.activeSession?.sessionId !== sessionId) return;
     eventReconnectAttempts = 0;
     state.liveConnectionState = "connected";
     renderApp();
   };
 
   events.onmessage = (messageEvent) => {
-    if (currentEvents !== events) return;
+    if (currentEvents !== events || state.activeSession?.sessionId !== sessionId) return;
     const event = JSON.parse(messageEvent.data) as SessionEvent;
     if (event.type === "snapshot") {
-      reconcilePendingComposerSubmissions(event.snapshot);
-      state.activeSession = event.snapshot;
-      state.renameText = event.snapshot.title;
-      state.pageTitle = event.snapshot.title;
-      document.title = event.snapshot.title;
-      void loadSessions();
+      const sessionChanged = applySnapshot(event.snapshot);
+      if (sessionChanged) {
+        state.liveConnectionState = "connecting";
+        connectEvents(event.snapshot.sessionId);
+        refreshSessionsInBackground();
+      }
     }
     if (event.type === "error") state.error = event.message;
     if (event.type === "info") state.info = event.message;
@@ -478,7 +664,7 @@ function connectEvents(sessionId: string) {
   };
 
   events.onerror = () => {
-    if (currentEvents !== events) return;
+    if (currentEvents !== events || state.activeSession?.sessionId !== sessionId) return;
     events.close();
     currentEvents = undefined;
     state.liveConnectionState = "reconnecting";
@@ -676,21 +862,29 @@ function scheduleReconnect(sessionId: string) {
 
 async function reconnectActiveSession(sessionId: string) {
   const activeSession = state.activeSession;
-  if (!activeSession) return;
+  if (!activeSession || activeSession.sessionId !== sessionId) return;
 
   try {
     await attachToLiveSession(sessionId);
     return;
-  } catch {
+  } catch (error) {
+    if (isAbortError(error)) {
+      return;
+    }
     if (!activeSession.sessionFile) {
-      scheduleReconnect(sessionId);
+      if (state.activeSession?.sessionId === sessionId) {
+        scheduleReconnect(sessionId);
+      }
       return;
     }
   }
 
   try {
     await openSession(activeSession.sessionFile!);
-  } catch {
+  } catch (error) {
+    if (isAbortError(error)) {
+      return;
+    }
     if (state.activeSession?.sessionFile === activeSession.sessionFile) {
       scheduleReconnect(sessionId);
     }
@@ -1046,15 +1240,23 @@ async function handleSessionClick(session: ApiSessionListItem) {
 
   try {
     if (session.live) {
-      await attachToLiveSession(session.id);
-      return;
+      try {
+        await attachToLiveSession(session.id);
+        return;
+      } catch (error) {
+        if (isAbortError(error) || !session.sessionFile || !isSessionNotFoundError(error)) {
+          throw error;
+        }
+      }
     }
     if (session.sessionFile) {
       await openSession(session.sessionFile);
       return;
     }
   } catch (error) {
-    state.error = getErrorMessage(error);
+    if (!isAbortError(error)) {
+      state.error = getErrorMessage(error);
+    }
   } finally {
     const needsRender = state.switchingSessionId === session.id || state.isLoading;
     if (state.switchingSessionId === session.id) {
@@ -1706,25 +1908,43 @@ function renderSkeleton() {
 
 /* ─── API helpers ─── */
 
-async function apiGet<T>(path: string): Promise<T> {
-  const response = await fetch(path, { credentials: "same-origin" });
+async function apiGet<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+  const init: RequestInit = {
+    credentials: "same-origin",
+  };
+  if (options.signal) {
+    init.signal = options.signal;
+  }
+  const response = await fetch(path, init);
   if (!response.ok) throw new Error(await response.text());
   return (await response.json()) as T;
 }
 
-async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(path, {
+async function apiPost<T>(path: string, body: unknown, options: ApiRequestOptions = {}): Promise<T> {
+  const init: RequestInit = {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  };
+  if (options.signal) {
+    init.signal = options.signal;
+  }
+  const response = await fetch(path, init);
   if (!response.ok) throw new Error(await response.text());
   return (await response.json()) as T;
 }
 
 function getErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function isSessionNotFoundError(error: unknown) {
+  return /session not found/i.test(getErrorMessage(error));
 }
 
 if (typeof sidebarMediaQuery.addEventListener === "function") {

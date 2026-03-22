@@ -72,11 +72,19 @@ export class SessionRegistry {
       sessionManager,
     });
 
-    return await this.registerSession(session, sessionManager);
+    const liveSession = await this.registerSession(session, sessionManager);
+    this.pruneInactiveSessions([String(liveSession.session.sessionId)]);
+    return liveSession;
   }
 
   async openSession(sessionFile: string) {
     return this.openSessionInternal(sessionFile, false);
+  }
+
+  activateSession(sessionId: string) {
+    const liveSession = this.mustGetSession(sessionId);
+    this.pruneInactiveSessions([String(liveSession.session.sessionId)]);
+    return liveSession;
   }
 
   getLiveSession(sessionId: string) {
@@ -200,6 +208,16 @@ export class SessionRegistry {
     liveSession.respondToUiRequest(response);
   }
 
+  disposeIfInactive(sessionId: string) {
+    const liveSession = this.liveSessions.get(sessionId);
+    if (!liveSession || !this.isInactiveLiveSession(liveSession)) {
+      return;
+    }
+
+    this.unregisterLiveSession(liveSession);
+    liveSession.dispose();
+  }
+
   private mustGetSession(sessionId: string) {
     const liveSession = this.liveSessions.get(sessionId);
     if (!liveSession) {
@@ -211,6 +229,7 @@ export class SessionRegistry {
   private async openSessionInternal(sessionFile: string, forceReload: boolean) {
     const existing = this.liveSessionsByPath.get(sessionFile);
     if (existing && !forceReload) {
+      this.pruneInactiveSessions([String(existing.session.sessionId)]);
       return existing;
     }
 
@@ -230,7 +249,9 @@ export class SessionRegistry {
       sessionManager,
     });
 
-    return await this.registerSession(session, sessionManager);
+    const liveSession = await this.registerSession(session, sessionManager);
+    this.pruneInactiveSessions([String(liveSession.session.sessionId)]);
+    return liveSession;
   }
 
   private async listAllSessions() {
@@ -432,6 +453,22 @@ export class SessionRegistry {
     if (liveSession.session.sessionFile) {
       this.liveSessionsByPath.set(String(liveSession.session.sessionFile), liveSession);
     }
+  }
+
+  private pruneInactiveSessions(keepSessionIds: Iterable<string>) {
+    const keep = new Set([...keepSessionIds].map(String));
+    const staleSessions = [...this.liveSessions.entries()]
+      .filter(([sessionId, liveSession]) => !keep.has(sessionId) && this.isInactiveLiveSession(liveSession))
+      .map(([, liveSession]) => liveSession);
+
+    for (const liveSession of staleSessions) {
+      this.unregisterLiveSession(liveSession);
+      liveSession.dispose();
+    }
+  }
+
+  private isInactiveLiveSession(liveSession: LiveSession) {
+    return liveSession.subscribers.size === 0 && !Boolean(liveSession.session.isStreaming);
   }
 
   private startWatchingSessionsDirectory() {

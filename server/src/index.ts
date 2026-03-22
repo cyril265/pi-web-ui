@@ -50,14 +50,14 @@ app.post<{ Body: { path: string } }>("/api/sessions/open", async (request) => {
 });
 
 app.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId", async (request, reply) => {
-  const liveSession = sessionRegistry.getLiveSession(request.params.sessionId);
-  if (!liveSession) {
+  try {
+    const liveSession = sessionRegistry.activateSession(request.params.sessionId);
+    return {
+      snapshot: liveSession.getSnapshot(),
+    };
+  } catch {
     return reply.code(404).send({ message: "Session not found" });
   }
-
-  return {
-    snapshot: liveSession.getSnapshot(),
-  };
 });
 
 app.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId/events", async (request, reply) => {
@@ -87,6 +87,7 @@ app.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId/events", as
     if (!reply.raw.writableEnded) {
       reply.raw.end();
     }
+    sessionRegistry.disposeIfInactive(request.params.sessionId);
   });
 });
 
