@@ -30,6 +30,14 @@ type PendingAttachment = {
   data: string;
 };
 
+type PendingComposerSubmission = {
+  id: string;
+  sessionId: string;
+  matchSequence: number;
+  snapshotMessageCount: number;
+  message: ApiSessionSnapshot["messages"][number];
+};
+
 type ThemeMode = "light" | "dark" | "system";
 type ColorTheme = "default" | "gruvbox" | "ghostty";
 type ParsedToolCallMessage = {
@@ -51,6 +59,7 @@ type AppState = {
   composerText: string;
   composerMode: ComposerMode;
   attachments: PendingAttachment[];
+  pendingComposerSubmissions: PendingComposerSubmission[];
   forkMessages: ApiForkMessage[];
   treeMessages: ApiTreeMessage[];
   pendingExtensionUi: ApiExtensionUiRequest | undefined;
@@ -61,6 +70,7 @@ type AppState = {
   pageTitle: string | undefined;
   renameText: string;
   isLoading: boolean;
+  isSubmittingComposer: boolean;
   isLoadingForkMessages: boolean;
   isLoadingTreeMessages: boolean;
   isReopeningSession: boolean;
@@ -94,6 +104,7 @@ const state: AppState = {
   composerText: "",
   composerMode: "prompt",
   attachments: [],
+  pendingComposerSubmissions: [],
   forkMessages: [],
   treeMessages: [],
   pendingExtensionUi: undefined,
@@ -104,6 +115,7 @@ const state: AppState = {
   pageTitle: undefined,
   renameText: "",
   isLoading: true,
+  isSubmittingComposer: false,
   isLoadingForkMessages: false,
   isLoadingTreeMessages: false,
   isReopeningSession: false,
@@ -198,16 +210,41 @@ async function attachToLiveSession(sessionId: string) {
 
 async function sendComposer() {
   if (!state.activeSession) return;
+  if (state.isSubmittingComposer) return;
   if (!state.composerText.trim() && state.attachments.length === 0) return;
 
+  const activeSession = state.activeSession;
+  const sessionId = activeSession.sessionId;
+  const composerMode = state.composerMode;
   const submittedText = state.composerText;
   const submittedAttachments = [...state.attachments];
+  const optimisticMessage = createOptimisticComposerMessage(
+    submittedText,
+    composerMode === "prompt" ? submittedAttachments : [],
+  );
+  const matchingPendingCount = state.pendingComposerSubmissions.filter((submission) =>
+    submission.sessionId === sessionId &&
+    submission.message.role === optimisticMessage.role &&
+    submission.message.text === optimisticMessage.text,
+  ).length;
+  const pendingSubmission: PendingComposerSubmission = {
+    id: optimisticMessage.id,
+    sessionId,
+    matchSequence: matchingPendingCount + 1,
+    snapshotMessageCount: activeSession.messages.length,
+    message: optimisticMessage,
+  };
 
   // Clear immediately to avoid race with SSE events
+  state.isSubmittingComposer = true;
   state.composerText = "";
   state.attachments = [];
+  state.error = undefined;
   state.info = undefined;
+  state.pendingComposerSubmissions = [...state.pendingComposerSubmissions, pendingSubmission];
   renderApp();
+  scrollToBottom();
+  await waitForNextPaint();
 
   const body = {
     message: submittedText,
@@ -218,20 +255,22 @@ async function sendComposer() {
     })),
   };
 
-  const sessionId = state.activeSession.sessionId;
-
   try {
-    if (state.composerMode === "prompt") {
+    if (composerMode === "prompt") {
       await apiPost(`/api/sessions/${sessionId}/prompt`, body);
-    } else if (state.composerMode === "steer") {
+    } else if (composerMode === "steer") {
       await apiPost(`/api/sessions/${sessionId}/steer`, { message: submittedText });
     } else {
       await apiPost(`/api/sessions/${sessionId}/follow-up`, { message: submittedText });
     }
   } catch (error) {
+    state.pendingComposerSubmissions = state.pendingComposerSubmissions.filter((submission) => submission.id !== pendingSubmission.id);
     state.composerText = submittedText;
     state.attachments = submittedAttachments;
     state.error = getErrorMessage(error);
+    renderApp();
+  } finally {
+    state.isSubmittingComposer = false;
     renderApp();
   }
 }
@@ -375,6 +414,7 @@ async function handleFiles(files: FileList | null) {
 
 function openSnapshot(snapshot: ApiSessionSnapshot) {
   const previousSessionId = state.activeSession?.sessionId;
+  reconcilePendingComposerSubmissions(snapshot);
   state.activeSession = snapshot;
   if (previousSessionId !== snapshot.sessionId) {
     state.expandedToolCards = new Set<string>();
@@ -412,6 +452,7 @@ function connectEvents(sessionId: string) {
     if (currentEvents !== events) return;
     const event = JSON.parse(messageEvent.data) as SessionEvent;
     if (event.type === "snapshot") {
+      reconcilePendingComposerSubmissions(event.snapshot);
       state.activeSession = event.snapshot;
       state.renameText = event.snapshot.title;
       state.pageTitle = event.snapshot.title;
@@ -565,6 +606,53 @@ function getComposerPlaceholder(mode: ComposerMode) {
   if (mode === "steer") return "Steer Pi\u2026";
   if (mode === "follow-up") return "Follow up\u2026";
   return "Type a message...";
+}
+
+function createOptimisticComposerMessage(
+  text: string,
+  attachments: PendingAttachment[],
+): ApiSessionSnapshot["messages"][number] {
+  const attachmentLines = attachments.map((attachment) => `[image: ${attachment.mimeType}]`);
+  const messageText = [text, ...attachmentLines]
+    .filter((part) => part.trim().length > 0)
+    .join("\n");
+
+  return {
+    id: `optimistic-user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    role: attachments.length > 0 ? "user-with-attachments" : "user",
+    text: messageText,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function isComposerSubmissionReflected(
+  snapshot: ApiSessionSnapshot,
+  submission: PendingComposerSubmission,
+) {
+  if (submission.sessionId !== snapshot.sessionId) return false;
+  if (snapshot.messages.length < submission.snapshotMessageCount) return true;
+
+  const reflectedMatchCount = snapshot.messages
+    .slice(submission.snapshotMessageCount)
+    .filter((message) => message.role === submission.message.role && message.text === submission.message.text)
+    .length;
+
+  return reflectedMatchCount >= submission.matchSequence;
+}
+
+function reconcilePendingComposerSubmissions(snapshot: ApiSessionSnapshot) {
+  state.pendingComposerSubmissions = state.pendingComposerSubmissions.filter((submission) =>
+    submission.sessionId !== snapshot.sessionId || !isComposerSubmissionReflected(snapshot, submission),
+  );
+}
+
+function getRenderedMessages(snapshot: ApiSessionSnapshot) {
+  const pendingMessages = state.pendingComposerSubmissions
+    .filter((submission) => submission.sessionId === snapshot.sessionId)
+    .filter((submission) => !isComposerSubmissionReflected(snapshot, submission))
+    .map((submission) => submission.message);
+
+  return pendingMessages.length > 0 ? [...snapshot.messages, ...pendingMessages] : snapshot.messages;
 }
 
 function clearEventReconnectTimer() {
@@ -1102,8 +1190,8 @@ const template = () => html`
         <div class="pp-messages">
           ${state.isLoading
             ? renderSkeleton()
-            : state.activeSession?.messages.length
-              ? renderConversation(state.activeSession.messages)
+            : state.activeSession && getRenderedMessages(state.activeSession).length
+              ? renderConversation(getRenderedMessages(state.activeSession))
               : html`<div class="pp-empty">No messages yet. Start typing below.</div>`}
 
           ${state.activeSession?.toolExecutions.length
@@ -1150,6 +1238,7 @@ const template = () => html`
                 class="pp-composer-btn"
                 @click=${() => void sendComposer()}
                 title="Send"
+                ?disabled=${state.isSubmittingComposer}
               >\u27a4</button>`}
         </div>
 
@@ -1181,7 +1270,7 @@ const template = () => html`
           </span>
           ${state.showTokenUsage && state.activeSession
             ? html`<span class="pp-statusbar-stats">
-                ${state.activeSession.messages.length} msgs
+                ${getRenderedMessages(state.activeSession).length} msgs
               </span>`
             : nothing}
         </div>

@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@mariozechner/pi-web-ui": "^0.57.1",
-    "@pi-web-app/shared": "file:../shared",
+    "@pi-web-app/shared": "workspace:*",
     "lit": "^3.3.2",
     "marked": "^16.4.2"
   },

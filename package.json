@@ -2,20 +2,21 @@
   "name": "pi-web-app",
   "private": true,
   "type": "module",
+  "packageManager": "bun@1.3.11",
   "workspaces": [
     "shared",
     "server",
     "client"
   ],
   "scripts": {
-    "dev": "node ./scripts/dev.mjs",
-    "dev:server": "npm run dev --workspace @pi-web-app/server",
-    "dev:client": "npm run dev --workspace @pi-web-app/client",
-    "build": "npm run build --workspace @pi-web-app/shared && npm run build --workspace @pi-web-app/client && npm run build --workspace @pi-web-app/server",
-    "check": "npm run build --workspace @pi-web-app/shared && npm run check --workspace @pi-web-app/client && npm run check --workspace @pi-web-app/server",
-    "start": "npm run start --workspace @pi-web-app/server"
+    "dev": "bun ./scripts/dev.ts",
+    "dev:server": "bun run --filter @pi-web-app/server dev",
+    "dev:client": "bun run --filter @pi-web-app/client dev",
+    "build": "bun run --filter @pi-web-app/shared build && bun run --filter @pi-web-app/client build && bun run --filter @pi-web-app/server build",
+    "check": "bun run --filter @pi-web-app/shared build && bun run --filter @pi-web-app/client check && bun run --filter @pi-web-app/server check",
+    "start": "bun run --filter @pi-web-app/server start"
   },
   "devDependencies": {
-    "concurrently": "^9.2.1"
+    "typescript": "^5.9.3"
   }
 }

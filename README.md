@@ -5,14 +5,14 @@ Mobile-first web UI for `pi-coding-agent`.
 ## Development
 
 ```bash
-npm install
-npm run dev
+bun install
+bun run dev
 ```
 
 To expose the dev app on your local network temporarily for phone testing:
 
 ```bash
-HOST=0.0.0.0 npm run dev
+HOST=0.0.0.0 bun run dev
 ```
 
 The dev runner automatically finds free ports.
@@ -22,13 +22,13 @@ Default starting points:
 - web client: `http://127.0.0.1:5173`
 - api server: `http://127.0.0.1:3001`
 
-If those ports are already in use, `npm run dev` picks the next free ones and prints them.
+If those ports are already in use, `bun run dev` picks the next free ones and prints them.
 
 ## Production-style local run
 
 ```bash
-npm run build
-npm run start
+bun run build
+bun run start
 ```
 
 Then open:
