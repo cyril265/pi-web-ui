@@ -2,6 +2,7 @@ import { html, render, nothing } from "lit";
 import { live } from "lit/directives/live.js";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import { marked } from "marked";
+import { BUILTIN_SLASH_COMMANDS } from "@pi-web-app/shared";
 import type {
   ApiExtensionNotification,
   ApiExtensionStatusEntry,
@@ -10,6 +11,7 @@ import type {
   ApiForkMessage,
   ApiImageInput,
   ApiModelInfo,
+  ApiSlashCommand,
   ApiSessionListItem,
   ApiSessionSnapshot,
   ApiTreeMessage,
@@ -63,6 +65,10 @@ type AppState = {
   sessionsSearch: string;
   activeSession: ApiSessionSnapshot | undefined;
   availableModels: ApiModelInfo[];
+  recentModelKeys: string[];
+  modelSearch: string;
+  availableSlashCommands: ApiSlashCommand[];
+  selectedSlashCommandIndex: number;
   composerText: string;
   composerMode: ComposerMode;
   attachments: PendingAttachment[];
@@ -100,7 +106,17 @@ type AppState = {
 
 const SESSIONS_PER_GROUP = 5;
 const MOBILE_SIDEBAR_MEDIA_QUERY = "(max-width: 900px)";
+const RECENT_MODELS_STORAGE_KEY = "recent-models";
+const RECENT_MODELS_LIMIT = 8;
+const MAX_VISIBLE_SLASH_COMMANDS = 8;
 const sidebarMediaQuery = window.matchMedia(MOBILE_SIDEBAR_MEDIA_QUERY);
+
+function loadRecentModelKeys() {
+  return (localStorage.getItem(RECENT_MODELS_STORAGE_KEY) ?? "")
+    .split("\n")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
 
 const state: AppState = {
   sessions: [],
@@ -108,6 +124,10 @@ const state: AppState = {
   sessionsSearch: "",
   activeSession: undefined,
   availableModels: [],
+  recentModelKeys: loadRecentModelKeys(),
+  modelSearch: "",
+  availableSlashCommands: [...BUILTIN_SLASH_COMMANDS],
+  selectedSlashCommandIndex: 0,
   composerText: "",
   composerMode: "prompt",
   attachments: [],
@@ -147,6 +167,7 @@ let currentSessionSelectionController = new AbortController();
 let eventReconnectTimeout: ReturnType<typeof setTimeout> | undefined;
 let eventReconnectAttempts = 0;
 let sessionsLoadRequestId = 0;
+let slashCommandsLoadRequestId = 0;
 const levels: ThinkingLevel[] = ["off", "low", "medium", "high"];
 let messagesContainer: HTMLElement | null = null;
 const EVENT_RECONNECT_BASE_DELAY_MS = 1_000;
@@ -203,8 +224,40 @@ async function loadModels() {
   state.availableModels = response.models;
 }
 
+async function loadSlashCommands(sessionId: string) {
+  const requestId = ++slashCommandsLoadRequestId;
+  const response = await apiGet<{ commands: ApiSlashCommand[] }>(`/api/sessions/${sessionId}/commands`);
+  if (requestId !== slashCommandsLoadRequestId || state.activeSession?.sessionId !== sessionId) {
+    return;
+  }
+  state.availableSlashCommands = response.commands;
+  const visibleSlashCommands = getVisibleSlashCommands();
+  if (visibleSlashCommands.length === 0) {
+    state.selectedSlashCommandIndex = 0;
+  } else if (state.selectedSlashCommandIndex >= visibleSlashCommands.length) {
+    state.selectedSlashCommandIndex = visibleSlashCommands.length - 1;
+  }
+  renderApp();
+}
+
 function refreshSessionsInBackground(scope = state.sessionsScope) {
   void loadSessions(scope).catch((error) => {
+    state.error = getErrorMessage(error);
+    renderApp();
+  });
+}
+
+function refreshSlashCommandsInBackground(sessionId = state.activeSession?.sessionId) {
+  if (!sessionId) {
+    state.availableSlashCommands = [...BUILTIN_SLASH_COMMANDS];
+    state.selectedSlashCommandIndex = 0;
+    return;
+  }
+
+  void loadSlashCommands(sessionId).catch((error) => {
+    if (state.activeSession?.sessionId !== sessionId) {
+      return;
+    }
     state.error = getErrorMessage(error);
     renderApp();
   });
@@ -309,33 +362,75 @@ async function sendComposer() {
   const composerMode = state.composerMode;
   const submittedText = state.composerText;
   const submittedAttachments = [...state.attachments];
-  const optimisticMessage = createOptimisticComposerMessage(
-    submittedText,
-    composerMode === "prompt" ? submittedAttachments : [],
-  );
-  const matchingPendingCount = state.pendingComposerSubmissions.filter((submission) =>
-    submission.sessionId === sessionId &&
-    submission.message.role === optimisticMessage.role &&
-    submission.message.text === optimisticMessage.text,
-  ).length;
-  const pendingSubmission: PendingComposerSubmission = {
-    id: optimisticMessage.id,
-    sessionId,
-    matchSequence: matchingPendingCount + 1,
-    snapshotMessageCount: activeSession.messages.length,
-    message: optimisticMessage,
-  };
+  const parsedSlashCommand = parseSlashCommandInput(submittedText);
+  const slashCommand = parsedSlashCommand ? getSlashCommandByName(parsedSlashCommand.name) : undefined;
 
-  // Clear immediately to avoid race with SSE events
+  if (slashCommand?.source === "extension" && composerMode !== "prompt") {
+    state.error = `/${slashCommand.name} must be sent in prompt mode.`;
+    renderApp();
+    return;
+  }
+
+  if (slashCommand?.source === "builtin") {
+    if (submittedAttachments.length > 0) {
+      state.error = `/${slashCommand.name} does not accept image attachments in Pi Web.`;
+      renderApp();
+      return;
+    }
+
+    state.isSubmittingComposer = true;
+    state.error = undefined;
+    state.info = undefined;
+    renderApp();
+
+    try {
+      await executeBuiltinSlashCommand(slashCommand.name, parsedSlashCommand?.args ?? "");
+      state.composerText = "";
+      state.attachments = [];
+    } catch (error) {
+      state.error = getErrorMessage(error);
+    } finally {
+      state.isSubmittingComposer = false;
+      renderApp();
+    }
+    return;
+  }
+
+  const shouldCreateOptimisticMessage = !slashCommand;
+  let pendingSubmission: PendingComposerSubmission | undefined;
+
+  if (shouldCreateOptimisticMessage) {
+    const optimisticMessage = createOptimisticComposerMessage(
+      submittedText,
+      composerMode === "prompt" ? submittedAttachments : [],
+    );
+    const matchingPendingCount = state.pendingComposerSubmissions.filter((submission) =>
+      submission.sessionId === sessionId &&
+      submission.message.role === optimisticMessage.role &&
+      submission.message.text === optimisticMessage.text,
+    ).length;
+    pendingSubmission = {
+      id: optimisticMessage.id,
+      sessionId,
+      matchSequence: matchingPendingCount + 1,
+      snapshotMessageCount: activeSession.messages.length,
+      message: optimisticMessage,
+    };
+  }
+
   state.isSubmittingComposer = true;
   state.composerText = "";
   state.attachments = [];
   state.error = undefined;
   state.info = undefined;
-  state.pendingComposerSubmissions = [...state.pendingComposerSubmissions, pendingSubmission];
+  if (pendingSubmission) {
+    state.pendingComposerSubmissions = [...state.pendingComposerSubmissions, pendingSubmission];
+  }
   renderApp();
-  scrollToBottom();
-  await waitForNextPaint();
+  if (pendingSubmission) {
+    scrollToBottom();
+    await waitForNextPaint();
+  }
 
   const body = {
     message: submittedText,
@@ -355,7 +450,10 @@ async function sendComposer() {
       await apiPost(`/api/sessions/${sessionId}/follow-up`, { message: submittedText });
     }
   } catch (error) {
-    state.pendingComposerSubmissions = state.pendingComposerSubmissions.filter((submission) => submission.id !== pendingSubmission.id);
+    if (pendingSubmission) {
+      state.pendingComposerSubmissions = state.pendingComposerSubmissions
+        .filter((submission) => submission.id !== pendingSubmission?.id);
+    }
     state.composerText = submittedText;
     state.attachments = submittedAttachments;
     state.error = getErrorMessage(error);
@@ -375,12 +473,36 @@ async function cycleModel() {
   if (!state.activeSession) return;
   await apiPost(`/api/sessions/${state.activeSession.sessionId}/model/cycle`, {});
   state.showModels = false;
+  state.modelSearch = "";
+}
+
+function getModelKey(provider: string, modelId: string) {
+  return `${provider}/${modelId}`;
+}
+
+function persistRecentModels() {
+  localStorage.setItem(RECENT_MODELS_STORAGE_KEY, state.recentModelKeys.join("\n"));
+}
+
+function rememberRecentModel(provider: string, modelId: string) {
+  const modelKey = getModelKey(provider, modelId);
+  state.recentModelKeys = [modelKey, ...state.recentModelKeys.filter((value) => value !== modelKey)]
+    .slice(0, RECENT_MODELS_LIMIT);
+  persistRecentModels();
+}
+
+function openModelsDialog() {
+  state.showModels = true;
+  state.modelSearch = "";
+  renderApp();
 }
 
 async function setModel(provider: string, modelId: string) {
   if (!state.activeSession) return;
   await apiPost(`/api/sessions/${state.activeSession.sessionId}/model`, { provider, modelId });
+  rememberRecentModel(provider, modelId);
   state.showModels = false;
+  state.modelSearch = "";
 }
 
 async function setThinkingLevel(level: ThinkingLevel) {
@@ -590,6 +712,8 @@ function applySnapshot(snapshot: ApiSessionSnapshot, options: { resetSessionUi?:
   const sessionChanged = previousSessionId !== snapshot.sessionId;
   if (sessionChanged) {
     state.expandedToolCards = new Set<string>();
+    state.availableSlashCommands = [...BUILTIN_SLASH_COMMANDS];
+    state.selectedSlashCommandIndex = 0;
     clearRenderedMessageCaches();
   }
   state.renameText = snapshot.title;
@@ -615,6 +739,7 @@ function openSnapshot(snapshot: ApiSessionSnapshot, selectionToken?: number) {
     return false;
   }
   applySnapshot(snapshot, { resetSessionUi: true });
+  refreshSlashCommandsInBackground(snapshot.sessionId);
   state.liveConnectionState = "connecting";
   connectEvents(snapshot.sessionId);
   renderApp();
@@ -643,6 +768,7 @@ function connectEvents(sessionId: string) {
         state.liveConnectionState = "connecting";
         connectEvents(event.snapshot.sessionId);
         refreshSessionsInBackground();
+        refreshSlashCommandsInBackground(event.snapshot.sessionId);
       }
     }
     if (event.type === "error") state.error = event.message;
@@ -792,6 +918,296 @@ function getComposerPlaceholder(mode: ComposerMode) {
   if (mode === "steer") return "Steer Pi\u2026";
   if (mode === "follow-up") return "Follow up\u2026";
   return "Type a message...";
+}
+
+function matchesSearchTokens(text: string, query: string) {
+  const haystack = text.toLowerCase();
+  const tokens = query
+    .toLowerCase()
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  return tokens.every((token) => haystack.includes(token));
+}
+
+function getVisibleModels() {
+  const query = state.modelSearch.trim();
+  const currentModelKey = state.activeSession?.model
+    ? getModelKey(state.activeSession.model.provider, state.activeSession.model.id)
+    : undefined;
+
+  return [...state.availableModels]
+    .filter((model) => {
+      if (!query) return true;
+      return matchesSearchTokens(`${model.name} ${model.provider} ${model.id}`, query);
+    })
+    .sort((left, right) => {
+      const leftKey = getModelKey(left.provider, left.id);
+      const rightKey = getModelKey(right.provider, right.id);
+      const leftRecentIndex = state.recentModelKeys.indexOf(leftKey);
+      const rightRecentIndex = state.recentModelKeys.indexOf(rightKey);
+      const normalizedLeftRecentIndex = leftRecentIndex === -1 ? Number.MAX_SAFE_INTEGER : leftRecentIndex;
+      const normalizedRightRecentIndex = rightRecentIndex === -1 ? Number.MAX_SAFE_INTEGER : rightRecentIndex;
+      if (normalizedLeftRecentIndex !== normalizedRightRecentIndex) {
+        return normalizedLeftRecentIndex - normalizedRightRecentIndex;
+      }
+
+      const leftIsCurrent = leftKey === currentModelKey;
+      const rightIsCurrent = rightKey === currentModelKey;
+      if (leftIsCurrent !== rightIsCurrent) {
+        return leftIsCurrent ? -1 : 1;
+      }
+
+      const nameComparison = left.name.localeCompare(right.name);
+      if (nameComparison !== 0) {
+        return nameComparison;
+      }
+
+      return leftKey.localeCompare(rightKey);
+    });
+}
+
+function getSlashCommandCatalog() {
+  const commands = state.availableSlashCommands.length > 0
+    ? state.availableSlashCommands
+    : [...BUILTIN_SLASH_COMMANDS];
+  const commandsByName = new Map<string, ApiSlashCommand>();
+  for (const command of commands) {
+    if (!commandsByName.has(command.name)) {
+      commandsByName.set(command.name, command);
+    }
+  }
+  return [...commandsByName.values()];
+}
+
+function getSlashCommandByName(name: string) {
+  return getSlashCommandCatalog().find((command) => command.name.toLowerCase() === name.toLowerCase());
+}
+
+function getSlashCommandQuery(text: string) {
+  const match = text.match(/^\/([^\s\n]*)$/);
+  return match?.[1]?.toLowerCase();
+}
+
+function parseSlashCommandInput(text: string) {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+  if (!match) {
+    return undefined;
+  }
+
+  return {
+    name: match[1]?.toLowerCase() ?? "",
+    args: match[2]?.trim() ?? "",
+  };
+}
+
+function getVisibleSlashCommands() {
+  const query = getSlashCommandQuery(state.composerText);
+  if (query === undefined) {
+    return [];
+  }
+
+  return getSlashCommandCatalog()
+    .filter((command) => {
+      if (!query) {
+        return true;
+      }
+
+      return matchesSearchTokens(`${command.name} ${command.description ?? ""}`, query);
+    })
+    .slice(0, MAX_VISIBLE_SLASH_COMMANDS);
+}
+
+function getSelectedSlashCommand() {
+  const visibleSlashCommands = getVisibleSlashCommands();
+  if (visibleSlashCommands.length === 0) {
+    return undefined;
+  }
+
+  const selectedIndex = Math.min(state.selectedSlashCommandIndex, visibleSlashCommands.length - 1);
+  return visibleSlashCommands[Math.max(0, selectedIndex)];
+}
+
+function focusComposerInput() {
+  requestAnimationFrame(() => {
+    const composer = document.querySelector(".pp-composer-input");
+    if (composer instanceof HTMLTextAreaElement) {
+      composer.focus();
+      const position = composer.value.length;
+      composer.setSelectionRange(position, position);
+    }
+  });
+}
+
+function applySlashCommandSelection(command: ApiSlashCommand) {
+  state.composerText = `/${command.name} `;
+  state.selectedSlashCommandIndex = 0;
+  renderApp();
+  focusComposerInput();
+}
+
+function moveSelectedSlashCommand(delta: number) {
+  const visibleSlashCommands = getVisibleSlashCommands();
+  if (visibleSlashCommands.length === 0) {
+    return;
+  }
+
+  state.selectedSlashCommandIndex =
+    (state.selectedSlashCommandIndex + delta + visibleSlashCommands.length) % visibleSlashCommands.length;
+  renderApp();
+}
+
+function getSlashCommandSourceLabel(command: ApiSlashCommand) {
+  if (command.source === "builtin") return "Built-in";
+  if (command.source === "prompt") return command.location ? `Prompt · ${command.location}` : "Prompt";
+  if (command.source === "skill") return command.location ? `Skill · ${command.location}` : "Skill";
+  return "Extension";
+}
+
+function isSlashCommandSupportedInWeb(command: ApiSlashCommand) {
+  if (command.source !== "builtin") {
+    return true;
+  }
+
+  return new Set([
+    "compact",
+    "copy",
+    "fork",
+    "model",
+    "name",
+    "new",
+    "reload",
+    "resume",
+    "session",
+    "settings",
+    "tree",
+  ]).has(command.name);
+}
+
+async function executeBuiltinSlashCommand(commandName: string, args: string) {
+  if (!state.activeSession) {
+    return true;
+  }
+
+  const trimmedArgs = args.trim();
+  const activeSession = state.activeSession;
+
+  switch (commandName) {
+    case "compact": {
+      const response = await apiPost<{ snapshot: ApiSessionSnapshot }>(
+        `/api/sessions/${activeSession.sessionId}/compact`,
+        { instructions: trimmedArgs || undefined },
+      );
+      if (state.activeSession?.sessionId === activeSession.sessionId) {
+        openSnapshot(response.snapshot);
+        state.info = trimmedArgs ? "Session compacted with custom instructions." : "Session compacted.";
+        renderApp();
+      }
+      return true;
+    }
+    case "copy": {
+      const lastAssistantMessage = [...activeSession.messages].reverse().find((message) => message.role === "assistant");
+      if (!lastAssistantMessage?.text.trim()) {
+        state.error = "No assistant message is available to copy yet.";
+        renderApp();
+        return true;
+      }
+      await navigator.clipboard.writeText(lastAssistantMessage.text);
+      state.info = "Copied the last assistant message.";
+      renderApp();
+      return true;
+    }
+    case "fork":
+    case "tree":
+      await openActions();
+      return true;
+    case "model":
+      if (!trimmedArgs) {
+        openModelsDialog();
+        return true;
+      }
+      await setModelFromSlashCommand(trimmedArgs);
+      return true;
+    case "name":
+      if (!trimmedArgs) {
+        await openActions();
+        return true;
+      }
+      state.renameText = trimmedArgs;
+      await renameSession();
+      return true;
+    case "new":
+      await handleCreateSession();
+      return true;
+    case "reload": {
+      const response = await apiPost<{ snapshot: ApiSessionSnapshot }>(
+        `/api/sessions/${activeSession.sessionId}/reload`,
+        {},
+      );
+      if (state.activeSession?.sessionId === activeSession.sessionId) {
+        openSnapshot(response.snapshot);
+        refreshSessionsInBackground();
+        refreshSlashCommandsInBackground(activeSession.sessionId);
+        state.info = "Reloaded extensions, skills, prompts, and themes.";
+        renderApp();
+      }
+      return true;
+    }
+    case "resume":
+      state.sidebarOpen = true;
+      state.showMenu = false;
+      state.info = "Pick a session from the sidebar to resume it.";
+      renderApp();
+      focusComposerInput();
+      return true;
+    case "session": {
+      const modelLabel = activeSession.model ? `${activeSession.model.provider}/${activeSession.model.id}` : "No model";
+      state.info = `${activeSession.title} · ${activeSession.messages.length} msgs · ${modelLabel}`;
+      renderApp();
+      return true;
+    }
+    case "settings":
+      state.showMenu = true;
+      renderApp();
+      return true;
+    default:
+      state.error = `/${commandName} is not available in Pi Web yet.`;
+      renderApp();
+      return true;
+  }
+}
+
+async function setModelFromSlashCommand(query: string) {
+  const normalizedQuery = query.trim().toLowerCase();
+  const matchingModel = [...state.availableModels]
+    .sort((left, right) => {
+      const leftIndex = state.recentModelKeys.indexOf(getModelKey(left.provider, left.id));
+      const rightIndex = state.recentModelKeys.indexOf(getModelKey(right.provider, right.id));
+      const normalizedLeftIndex = leftIndex === -1 ? Number.MAX_SAFE_INTEGER : leftIndex;
+      const normalizedRightIndex = rightIndex === -1 ? Number.MAX_SAFE_INTEGER : rightIndex;
+      if (normalizedLeftIndex !== normalizedRightIndex) {
+        return normalizedLeftIndex - normalizedRightIndex;
+      }
+      return left.name.localeCompare(right.name);
+    })
+    .find((model) => {
+      const modelKey = getModelKey(model.provider, model.id).toLowerCase();
+      return (
+        modelKey === normalizedQuery ||
+        model.id.toLowerCase() === normalizedQuery ||
+        model.name.toLowerCase() === normalizedQuery ||
+        matchesSearchTokens(`${model.name} ${model.provider} ${model.id}`, normalizedQuery)
+      );
+    });
+
+  if (!matchingModel) {
+    state.error = `No model matched "${query}".`;
+    renderApp();
+    return;
+  }
+
+  await setModel(matchingModel.provider, matchingModel.id);
 }
 
 function createOptimisticComposerMessage(
@@ -1408,40 +1824,66 @@ const template = () => html`
         ${renderExtensionWidgets("aboveEditor")}
 
         <!-- Composer -->
-        <div class="pp-composer">
-          <label class="pp-composer-attach" title="Attach images">
-            \ud83d\udcce
-            <input
-              type="file"
-              accept="image/*"
-              multiple
-              @change=${(e: Event) => handleFiles((e.target as HTMLInputElement).files)}
-            />
-          </label>
-          ${state.attachments.length ? renderAttachmentsRow() : nothing}
-          <textarea
-            class="pp-composer-input"
-            rows="1"
-            placeholder=${getComposerPlaceholder(state.composerMode)}
-            .value=${live(state.composerText)}
-            @input=${(e: Event) => { state.composerText = (e.target as HTMLTextAreaElement).value; }}
-            @keydown=${(e: KeyboardEvent) => {
-              if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendComposer(); }
-            }}
-          ></textarea>
-          ${state.activeSession?.status === "streaming"
-            ? html`<button
-                class="pp-composer-btn"
-                style="color:var(--pp-error-text);"
-                @click=${abortRun}
-                title="Stop"
-              >\u25a0</button>`
-            : html`<button
-                class="pp-composer-btn"
-                @click=${() => void sendComposer()}
-                title="Send"
-                ?disabled=${state.isSubmittingComposer}
-              >\u27a4</button>`}
+        <div class="pp-composer-shell">
+          ${renderSlashCommandPalette()}
+          <div class="pp-composer">
+            <label class="pp-composer-attach" title="Attach images">
+              \ud83d\udcce
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                @change=${(e: Event) => handleFiles((e.target as HTMLInputElement).files)}
+              />
+            </label>
+            ${state.attachments.length ? renderAttachmentsRow() : nothing}
+            <textarea
+              class="pp-composer-input"
+              rows="1"
+              placeholder=${getComposerPlaceholder(state.composerMode)}
+              .value=${live(state.composerText)}
+              @input=${(e: Event) => {
+                state.composerText = (e.target as HTMLTextAreaElement).value;
+                state.selectedSlashCommandIndex = 0;
+                renderApp();
+              }}
+              @keydown=${(e: KeyboardEvent) => {
+                const selectedSlashCommand = getSelectedSlashCommand();
+                if (selectedSlashCommand && e.key === "ArrowDown") {
+                  e.preventDefault();
+                  moveSelectedSlashCommand(1);
+                  return;
+                }
+                if (selectedSlashCommand && e.key === "ArrowUp") {
+                  e.preventDefault();
+                  moveSelectedSlashCommand(-1);
+                  return;
+                }
+                if (selectedSlashCommand && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))) {
+                  e.preventDefault();
+                  applySlashCommandSelection(selectedSlashCommand);
+                  return;
+                }
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void sendComposer();
+                }
+              }}
+            ></textarea>
+            ${state.activeSession?.status === "streaming"
+              ? html`<button
+                  class="pp-composer-btn"
+                  style="color:var(--pp-error-text);"
+                  @click=${abortRun}
+                  title="Stop"
+                >\u25a0</button>`
+              : html`<button
+                  class="pp-composer-btn"
+                  @click=${() => void sendComposer()}
+                  title="Send"
+                  ?disabled=${state.isSubmittingComposer}
+                >\u27a4</button>`}
+          </div>
         </div>
 
         ${renderExtensionWidgets("belowEditor")}
@@ -1460,7 +1902,7 @@ const template = () => html`
           ${state.extensionStatuses.map(
             (s) => html`<span style="font-size:0.6875rem;">${s.key}: ${s.text}</span>`,
           )}
-          <button class="pp-statusbar-model" @click=${() => { state.showModels = true; renderApp(); }}>
+          <button class="pp-statusbar-model" @click=${openModelsDialog}>
             ${state.activeSession?.model?.name ?? "No model"}
           </button>
           <span class="pp-statusbar-icon" title="Thinking: ${state.activeSession?.thinkingLevel ?? 'off'}">
@@ -1740,9 +2182,47 @@ function renderToasts() {
   `;
 }
 
+function renderSlashCommandPalette() {
+  const visibleSlashCommands = getVisibleSlashCommands();
+  if (visibleSlashCommands.length === 0) {
+    return nothing;
+  }
+
+  return html`
+    <div class="pp-slash-commands">
+      <div class="pp-slash-commands-title">Commands</div>
+      ${visibleSlashCommands.map((command, index) => html`
+        <button
+          class="pp-slash-command-item ${index === state.selectedSlashCommandIndex ? "active" : ""}"
+          @mousedown=${(event: Event) => {
+            event.preventDefault();
+            applySlashCommandSelection(command);
+          }}
+        >
+          <div class="pp-slash-command-header">
+            <span class="pp-slash-command-name">/${command.name}</span>
+            <span class="pp-slash-command-source">${getSlashCommandSourceLabel(command)}</span>
+          </div>
+          ${command.description
+            ? html`<div class="pp-slash-command-desc">${command.description}</div>`
+            : nothing}
+          ${command.source === "builtin" && !isSlashCommandSupportedInWeb(command)
+            ? html`<div class="pp-slash-command-note">Not available in Pi Web yet.</div>`
+            : nothing}
+        </button>
+      `)}
+    </div>
+  `;
+}
+
 /* ─── Models dialog ─── */
 
 function renderModelsDialog() {
+  const visibleModels = getVisibleModels();
+  const currentModelKey = state.activeSession?.model
+    ? getModelKey(state.activeSession.model.provider, state.activeSession.model.id)
+    : undefined;
+
   return html`
     <div class="pp-dialog-overlay" @click=${() => { state.showModels = false; renderApp(); }}>
       <div class="pp-dialog" @click=${(e: Event) => e.stopPropagation()}>
@@ -1753,14 +2233,38 @@ function renderModelsDialog() {
             <button class="pp-dialog-btn" @click=${() => { state.showModels = false; renderApp(); }}>Done</button>
           </div>
         </div>
-        ${state.availableModels.map(
-          (m) => html`
-            <button class="pp-dialog-item" @click=${() => setModel(m.provider, m.id)}>
-              <div class="pp-dialog-item-title">${m.name}</div>
-              <div class="pp-dialog-item-desc">${m.provider}/${m.id}</div>
-            </button>
-          `,
-        )}
+        <input
+          class="pp-dialog-input"
+          style="margin-bottom:0.5rem;"
+          .value=${live(state.modelSearch)}
+          @input=${(event: Event) => {
+            state.modelSearch = (event.target as HTMLInputElement).value;
+            renderApp();
+          }}
+          placeholder="Search models…"
+        />
+        <div class="pp-dialog-subtitle">
+          Search by name, provider, or model ID. Recently used models stay pinned at the top.
+        </div>
+        ${visibleModels.length
+          ? visibleModels.map((model) => {
+              const modelKey = getModelKey(model.provider, model.id);
+              const isCurrent = modelKey === currentModelKey;
+              const isRecent = state.recentModelKeys.includes(modelKey);
+              return html`
+                <button class="pp-dialog-item" @click=${() => setModel(model.provider, model.id)}>
+                  <div class="pp-dialog-item-header">
+                    <div class="pp-dialog-item-title">${model.name}</div>
+                    <div class="pp-dialog-item-badges">
+                      ${isCurrent ? html`<span class="pp-dialog-item-badge current">Current</span>` : nothing}
+                      ${isRecent ? html`<span class="pp-dialog-item-badge">Recent</span>` : nothing}
+                    </div>
+                  </div>
+                  <div class="pp-dialog-item-desc">${model.provider}/${model.id}</div>
+                </button>
+              `;
+            })
+          : html`<div class="pp-dialog-empty">No models match your search.</div>`}
       </div>
     </div>
   `;

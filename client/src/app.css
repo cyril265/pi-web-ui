@@ -724,6 +724,10 @@ button:not(:disabled) {
 }
 
 /* ── Composer ── */
+.pp-composer-shell {
+  flex-shrink: 0;
+}
+
 .pp-composer {
   border-top: 1px solid var(--pp-border);
   background: var(--pp-composer-bg);
@@ -789,6 +793,61 @@ button:not(:disabled) {
   padding: 0.25rem;
   display: flex;
   align-items: center;
+}
+
+.pp-slash-commands {
+  padding: 0.5rem 1rem 0;
+  border-top: 1px solid var(--pp-border);
+  background: var(--pp-composer-bg);
+}
+
+.pp-slash-commands-title {
+  margin-bottom: 0.375rem;
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--pp-text-muted);
+}
+
+.pp-slash-command-item {
+  width: 100%;
+  margin-bottom: 0.375rem;
+  padding: 0.625rem 0.75rem;
+  border: 1px solid var(--pp-border);
+  border-radius: 0.5rem;
+  background: var(--pp-bg);
+  color: var(--pp-text);
+  text-align: left;
+}
+
+.pp-slash-command-item:hover,
+.pp-slash-command-item.active {
+  background: var(--pp-sidebar-hover);
+}
+
+.pp-slash-command-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.pp-slash-command-name {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.pp-slash-command-source,
+.pp-slash-command-note {
+  font-size: 0.6875rem;
+  color: var(--pp-text-muted);
+}
+
+.pp-slash-command-desc {
+  margin-top: 0.1875rem;
+  font-size: 0.75rem;
+  color: var(--pp-text-muted);
 }
 
 /* ── Status bar ── */
@@ -1224,13 +1283,47 @@ button:not(:disabled) {
   background: var(--pp-sidebar-hover);
 }
 
+.pp-dialog-item-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
 .pp-dialog-item-title {
   font-weight: 600;
   margin-bottom: 0.125rem;
 }
 
+.pp-dialog-item-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.pp-dialog-item-badge {
+  padding: 0.125rem 0.375rem;
+  border-radius: 9999px;
+  background: var(--pp-sidebar-hover);
+  font-size: 0.625rem;
+  font-weight: 600;
+  color: var(--pp-text-muted);
+  white-space: nowrap;
+}
+
+.pp-dialog-item-badge.current {
+  background: rgba(59, 130, 246, 0.12);
+  color: var(--pp-accent);
+}
+
 .pp-dialog-item-desc {
   font-size: 0.75rem;
+  color: var(--pp-text-muted);
+}
+
+.pp-dialog-empty {
+  padding: 0.875rem 0.25rem 0.25rem;
+  font-size: 0.8125rem;
   color: var(--pp-text-muted);
 }
 

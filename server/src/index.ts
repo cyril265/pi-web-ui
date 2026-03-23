@@ -60,6 +60,10 @@ app.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId", async (re
   }
 });
 
+app.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId/commands", async (request) => ({
+  commands: sessionRegistry.getSlashCommands(request.params.sessionId),
+}));
+
 app.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId/events", async (request, reply) => {
   const liveSession = sessionRegistry.getLiveSession(request.params.sessionId);
   if (!liveSession) {
@@ -147,6 +151,23 @@ app.post<{ Params: { sessionId: string }; Body: { name: string } }>("/api/sessio
 
 app.post<{ Params: { sessionId: string } }>("/api/sessions/:sessionId/reopen", async (request) => {
   const liveSession = await sessionRegistry.reopenSession(request.params.sessionId);
+  return {
+    snapshot: liveSession.getSnapshot(),
+  };
+});
+
+app.post<{ Params: { sessionId: string }; Body: { instructions?: string } }>(
+  "/api/sessions/:sessionId/compact",
+  async (request) => {
+    const liveSession = await sessionRegistry.compactSession(request.params.sessionId, request.body.instructions);
+    return {
+      snapshot: liveSession.getSnapshot(),
+    };
+  },
+);
+
+app.post<{ Params: { sessionId: string } }>("/api/sessions/:sessionId/reload", async (request) => {
+  const liveSession = await sessionRegistry.reloadSession(request.params.sessionId);
   return {
     snapshot: liveSession.getSnapshot(),
   };

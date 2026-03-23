@@ -70,6 +70,39 @@ export interface ApiSessionSnapshot {
   toolExecutions: ApiToolExecution[];
 }
 
+export type ApiSlashCommandSource = "builtin" | "extension" | "prompt" | "skill";
+export type ApiSlashCommandLocation = "user" | "project" | "path";
+
+export interface ApiSlashCommand {
+  name: string;
+  description?: string;
+  source: ApiSlashCommandSource;
+  location?: ApiSlashCommandLocation;
+  path?: string;
+}
+
+export const BUILTIN_SLASH_COMMANDS: readonly ApiSlashCommand[] = [
+  { name: "settings", description: "Open settings menu", source: "builtin" },
+  { name: "model", description: "Select model (opens selector UI)", source: "builtin" },
+  { name: "scoped-models", description: "Enable/disable models for Ctrl+P cycling", source: "builtin" },
+  { name: "export", description: "Export session to HTML file", source: "builtin" },
+  { name: "share", description: "Share session as a secret GitHub gist", source: "builtin" },
+  { name: "copy", description: "Copy last agent message to clipboard", source: "builtin" },
+  { name: "name", description: "Set session display name", source: "builtin" },
+  { name: "session", description: "Show session info and stats", source: "builtin" },
+  { name: "changelog", description: "Show changelog entries", source: "builtin" },
+  { name: "hotkeys", description: "Show all keyboard shortcuts", source: "builtin" },
+  { name: "fork", description: "Create a new fork from a previous message", source: "builtin" },
+  { name: "tree", description: "Navigate session tree (switch branches)", source: "builtin" },
+  { name: "login", description: "Login with OAuth provider", source: "builtin" },
+  { name: "logout", description: "Logout from OAuth provider", source: "builtin" },
+  { name: "new", description: "Start a new session", source: "builtin" },
+  { name: "compact", description: "Manually compact the session context", source: "builtin" },
+  { name: "resume", description: "Resume a different session", source: "builtin" },
+  { name: "reload", description: "Reload extensions, skills, prompts, and themes", source: "builtin" },
+  { name: "quit", description: "Quit pi", source: "builtin" },
+];
+
 export interface ApiExtensionUiRequest {
   id: string;
   method: "select" | "confirm" | "input" | "editor";

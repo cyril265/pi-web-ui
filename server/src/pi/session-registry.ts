@@ -8,10 +8,12 @@ import {
   ModelRegistry,
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
+import { BUILTIN_SLASH_COMMANDS } from "@pi-web-app/shared";
 import type {
   ApiForkMessage,
   ApiImageInput,
   ApiModelInfo,
+  ApiSlashCommand,
   ApiSessionListItem,
   ApiTreeMessage,
   ThinkingLevel,
@@ -20,6 +22,23 @@ import { LiveSession } from "./live-session.js";
 import { deriveTitle, extractMessageText, serializeModel } from "./serialize.js";
 
 const INTERNAL_CHANGE_WINDOW_MS = 300;
+
+const normalizeSlashCommandLocation = (source: unknown): ApiSlashCommand["location"] =>
+  source === "user" || source === "project" || source === "path" ? source : undefined;
+
+const createSlashCommand = (
+  command: Pick<ApiSlashCommand, "name" | "source"> & {
+    description?: string | undefined;
+    location?: ApiSlashCommand["location"] | undefined;
+    path?: string | undefined;
+  },
+): ApiSlashCommand => ({
+  name: command.name,
+  source: command.source,
+  ...(command.description ? { description: command.description } : {}),
+  ...(command.location ? { location: command.location } : {}),
+  ...(command.path ? { path: command.path } : {}),
+});
 
 type CreateAgentSessionResult = Awaited<ReturnType<typeof createAgentSession>>;
 type AgentSession = CreateAgentSessionResult["session"];
@@ -99,6 +118,64 @@ export class SessionRegistry {
       .sort((left, right) => left.name.localeCompare(right.name));
   }
 
+  getSlashCommands(sessionId: string): ApiSlashCommand[] {
+    const liveSession = this.mustGetSession(sessionId);
+    const reservedBuiltins = new Set(BUILTIN_SLASH_COMMANDS.map((command) => command.name));
+
+    const registeredExtensionCommands = (liveSession.session.extensionRunner?.getRegisteredCommandsWithPaths() ??
+      []) as Array<{
+        command: {
+          name: string;
+          description?: string;
+        };
+        extensionPath?: string;
+      }>;
+    const extensionCommands: ApiSlashCommand[] = registeredExtensionCommands
+      .filter(({ command }) => !reservedBuiltins.has(command.name))
+      .map(({ command, extensionPath }) =>
+        createSlashCommand({
+          name: command.name,
+          description: command.description,
+          source: "extension",
+          path: extensionPath,
+        }),
+      );
+
+    const promptTemplates = liveSession.session.promptTemplates as Array<{
+      name: string;
+      description?: string;
+      source?: string;
+      filePath?: string;
+    }>;
+    const promptCommands: ApiSlashCommand[] = promptTemplates.map((template) =>
+      createSlashCommand({
+        name: template.name,
+        description: template.description,
+        source: "prompt",
+        location: normalizeSlashCommandLocation(template.source),
+        path: template.filePath,
+      }),
+    );
+
+    const skills = liveSession.session.resourceLoader.getSkills().skills as Array<{
+      name: string;
+      description?: string;
+      source?: string;
+      filePath?: string;
+    }>;
+    const skillCommands: ApiSlashCommand[] = skills.map((skill) =>
+      createSlashCommand({
+        name: `skill:${skill.name}`,
+        description: skill.description,
+        source: "skill",
+        location: normalizeSlashCommandLocation(skill.source),
+        path: skill.filePath,
+      }),
+    );
+
+    return [...BUILTIN_SLASH_COMMANDS, ...promptCommands, ...extensionCommands, ...skillCommands];
+  }
+
   async prompt(sessionId: string, message: string, images: ApiImageInput[]) {
     const liveSession = this.mustGetSession(sessionId);
     await liveSession.session.prompt(message, images.length > 0 ? { images: images.map(toSdkImage) } : undefined);
@@ -135,6 +212,13 @@ export class SessionRegistry {
 
     await liveSession.session.setModel(model);
     liveSession.publishSnapshot();
+  }
+
+  async compactSession(sessionId: string, instructions?: string) {
+    const liveSession = this.mustGetSession(sessionId);
+    await liveSession.session.compact(instructions);
+    liveSession.publishSnapshot();
+    return liveSession;
   }
 
   setThinkingLevel(sessionId: string, thinkingLevel: ThinkingLevel) {
@@ -201,6 +285,13 @@ export class SessionRegistry {
     liveSession.dispose();
 
     return this.openSessionInternal(sessionFile, true);
+  }
+
+  async reloadSession(sessionId: string) {
+    const liveSession = this.mustGetSession(sessionId);
+    await liveSession.session.reload();
+    liveSession.publishSnapshot();
+    return liveSession;
   }
 
   respondToUiRequest(sessionId: string, response: { id: string; value: string | undefined; confirmed: boolean | undefined; cancelled: boolean | undefined; }) {
