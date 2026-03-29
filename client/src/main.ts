@@ -58,14 +58,14 @@ type DisplayMode = "default" | "dense";
 type ParsedToolCallMessage = {
   toolName: string;
   toolCallId: string | undefined;
-  args: string;
+  arguments: unknown;
   preview: string | undefined;
 };
 type AssistantMessagePart =
   | { type: "markdown"; text: string }
   | { type: "thinking"; text: string }
   | { type: "toolCall"; toolCall: ParsedToolCallMessage };
-type ToolResultMessage = Pick<ApiSessionSnapshot["messages"][number], "text" | "isError">;
+type ToolResultMessage = Pick<ApiSessionSnapshot["messages"][number], "text" | "isError" | "toolCallId">;
 type ToolActivityState = "call" | ApiSessionSnapshot["toolExecutions"][number]["status"];
 type ConversationRenderResult = {
   entries: ReturnType<typeof html>[];
@@ -2322,13 +2322,26 @@ function formatToolCallMetadataValue(value: unknown) {
   return undefined;
 }
 
-function renderToolCallArguments(argsText: string) {
-  const trimmed = argsText.trim();
+function stringifyStructuredValue(value: unknown) {
+  if (typeof value === "string") return value;
+  if (value === undefined) return "";
+
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function renderToolCallArguments(argsValue: unknown) {
+  const trimmed = stringifyStructuredValue(argsValue).trim();
   if (!trimmed) {
     return html`<span class="pp-tool-inline-note">No arguments</span>`;
   }
 
-  const parsed = tryParseJson(trimmed);
+  const parsed = typeof argsValue === "string"
+    ? tryParseJson(trimmed)
+    : argsValue;
   if (!isRecord(parsed) || Array.isArray(parsed)) {
     return renderStructuredBlock(trimmed);
   }
@@ -2430,23 +2443,21 @@ function handleToolCardToggle(cardKey: string, event: Event) {
   requestRender();
 }
 
-function summarizeToolCallPreview(argsText: string) {
-  const trimmed = argsText.trim();
+function summarizeToolCallPreview(argsValue: unknown) {
+  const trimmed = stringifyStructuredValue(argsValue).trim();
   if (!trimmed) return undefined;
 
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (isRecord(parsed)) {
-      const preferredPreviewKeys = ["command", "path", "prompt", "message", "query"];
-      for (const key of preferredPreviewKeys) {
-        const value = parsed[key];
-        if (typeof value === "string" && value.trim()) {
-          return truncate(value, 60);
-        }
+  const parsed = typeof argsValue === "string"
+    ? tryParseJson(trimmed)
+    : argsValue;
+  if (isRecord(parsed) && !Array.isArray(parsed)) {
+    const preferredPreviewKeys = ["command", "path", "prompt", "message", "query"];
+    for (const key of preferredPreviewKeys) {
+      const value = parsed[key];
+      if (typeof value === "string" && value.trim()) {
+        return truncate(value, 60);
       }
     }
-  } catch {
-    // Fall back to a compact raw preview when tool arguments are partial JSON.
   }
 
   return truncate(trimmed.replace(/\s+/g, " "), 60);
@@ -2697,7 +2708,7 @@ function consumeToolCall(lines: string[], startIndex: number) {
 
   if (index >= lines.length) {
     return {
-      message: { toolName: header.toolName, toolCallId: header.toolCallId, args: "", preview: undefined },
+      message: { toolName: header.toolName, toolCallId: header.toolCallId, arguments: "", preview: undefined },
       nextIndex: index,
     };
   }
@@ -2715,13 +2726,13 @@ function consumeToolCall(lines: string[], startIndex: number) {
         (candidate.startsWith("[") && candidate.endsWith("]")))
     ) {
       try {
-        JSON.parse(candidate);
+        const parsedArguments = JSON.parse(candidate);
         return {
           message: {
             toolName: header.toolName,
             toolCallId: header.toolCallId,
-            args: candidate,
-            preview: summarizeToolCallPreview(candidate),
+            arguments: parsedArguments,
+            preview: summarizeToolCallPreview(parsedArguments),
           },
           nextIndex: end + 1,
         };
@@ -2736,16 +2747,51 @@ function consumeToolCall(lines: string[], startIndex: number) {
     endIndex += 1;
   }
 
-  const rawArgs = lines.slice(index, endIndex).join("\n").trim();
+  const rawArguments = lines.slice(index, endIndex).join("\n").trim();
   return {
     message: {
       toolName: header.toolName,
       toolCallId: header.toolCallId,
-      args: rawArgs,
-      preview: summarizeToolCallPreview(rawArgs),
+      arguments: rawArguments,
+      preview: summarizeToolCallPreview(rawArguments),
     },
     nextIndex: endIndex,
   };
+}
+
+function getAssistantMessageParts(message: ApiSessionSnapshot["messages"][number]) {
+  if (Array.isArray(message.parts) && message.parts.length > 0) {
+    const structuredParts = message.parts
+      .flatMap((part): AssistantMessagePart[] => {
+        if (part.type === "text") {
+          return part.text.trim() ? [{ type: "markdown", text: part.text }] : [];
+        }
+
+        if (part.type === "thinking") {
+          return part.text.trim() ? [{ type: "thinking", text: part.text }] : [];
+        }
+
+        if (part.type === "toolCall") {
+          return [{
+            type: "toolCall",
+            toolCall: {
+              toolName: part.toolName,
+              toolCallId: part.toolCallId,
+              arguments: part.arguments,
+              preview: summarizeToolCallPreview(part.arguments),
+            },
+          }];
+        }
+
+        return [];
+      });
+
+    if (structuredParts.length > 0) {
+      return structuredParts;
+    }
+  }
+
+  return parseAssistantMessageParts(message.text);
 }
 
 function renderToolCallMessage(
@@ -2782,7 +2828,7 @@ function renderToolCallMessage(
     detail: html`
       <div class="pp-tool-section">
         <div class="pp-tool-section-label">Call</div>
-        <div class="pp-tool-section-body">${renderToolCallArguments(toolCall.args)}</div>
+        <div class="pp-tool-section-body">${renderToolCallArguments(toolCall.arguments)}</div>
       </div>
       ${resultMessages.length > 0
         ? resultMessages.map((resultMessage, index) =>
@@ -3194,12 +3240,14 @@ function renderConversation(
     if (!message) continue;
 
     if (message.role === "assistant") {
-      const parts = parseAssistantMessageParts(message.text);
-      const toolCallCount = parts.filter((part) => part.type === "toolCall").length;
+      const parts = getAssistantMessageParts(message);
+      const toolCallParts = parts.filter((part): part is Extract<AssistantMessagePart, { type: "toolCall" }> =>
+        part.type === "toolCall"
+      );
       const groupedToolResults: ToolResultMessage[][] = [];
       const toolExecutionMatches: Array<ApiSessionSnapshot["toolExecutions"][number] | undefined> = [];
 
-      if (toolCallCount > 0) {
+      if (toolCallParts.length > 0) {
         const trailingToolResults: ToolResultMessage[] = [];
         let nextIndex = index + 1;
 
@@ -3208,11 +3256,27 @@ function renderConversation(
           nextIndex += 1;
         }
 
-        for (let toolCallIndex = 0; toolCallIndex < toolCallCount; toolCallIndex += 1) {
-          const assignedResults = trailingToolResults.length ? [trailingToolResults.shift()!] : [];
-          if (toolCallIndex === toolCallCount - 1 && trailingToolResults.length) {
+        for (let toolCallIndex = 0; toolCallIndex < toolCallParts.length; toolCallIndex += 1) {
+          const toolCall = toolCallParts[toolCallIndex]!.toolCall;
+          const assignedResults = toolCall.toolCallId
+            ? trailingToolResults.filter((result) => result.toolCallId === toolCall.toolCallId)
+            : [];
+
+          if (assignedResults.length > 0) {
+            for (const result of assignedResults) {
+              const resultIndex = trailingToolResults.indexOf(result);
+              if (resultIndex >= 0) {
+                trailingToolResults.splice(resultIndex, 1);
+              }
+            }
+          } else if (trailingToolResults.length > 0) {
+            assignedResults.push(trailingToolResults.shift()!);
+          }
+
+          if (toolCallIndex === toolCallParts.length - 1 && trailingToolResults.length > 0) {
             assignedResults.push(...trailingToolResults.splice(0));
           }
+
           groupedToolResults.push(assignedResults);
         }
 
@@ -3540,7 +3604,7 @@ function renderMessage(
   }
 
   if (message.role === "assistant") {
-    const parts = assistantParts ?? parseAssistantMessageParts(message.text);
+    const parts = assistantParts ?? getAssistantMessageParts(message);
     let toolCallIndex = 0;
     return html`${parts.map((part, partIndex) => {
       if (part.type === "toolCall") {

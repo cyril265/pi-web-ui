@@ -1,4 +1,11 @@
-import type { ApiMessage, ApiModelInfo, ApiSessionSnapshot, ApiToolExecution, SessionStatus } from "@pi-web-app/shared";
+import type {
+  ApiMessage,
+  ApiMessageContentPart,
+  ApiModelInfo,
+  ApiSessionSnapshot,
+  ApiToolExecution,
+  SessionStatus,
+} from "@pi-web-app/shared";
 
 const MAX_JSON_PREVIEW = 1_200;
 const THINKING_START_MARKER = "<<<pi-thinking>>>";
@@ -15,15 +22,23 @@ export const serializeModel = (model: any): ApiModelInfo | undefined => {
 };
 
 export const serializeMessage = (message: any, index: number): ApiMessage | undefined => {
+  const parts = serializeMessageParts(message);
   const serializedMessage: ApiMessage = {
     id: String(message?.id ?? `${message?.role ?? "message"}-${index}`),
     role: String(message?.role ?? "unknown"),
     text: extractMessageText(message),
     timestamp: message?.timestamp ? String(message.timestamp) : undefined,
     ...(typeof message?.isError === "boolean" ? { isError: message.isError } : {}),
+    ...(typeof message?.toolCallId === "string" && message.toolCallId.trim()
+      ? { toolCallId: message.toolCallId.trim() }
+      : {}),
+    ...(typeof message?.toolName === "string" && message.toolName.trim()
+      ? { toolName: message.toolName.trim() }
+      : {}),
+    ...(parts.length > 0 ? { parts } : {}),
   };
 
-  return serializedMessage.text.trim().length > 0 ? serializedMessage : undefined;
+  return serializedMessage.text.trim().length > 0 || parts.length > 0 ? serializedMessage : undefined;
 };
 
 export const serializeMessages = (messages: any[] | undefined): ApiMessage[] => {
@@ -81,8 +96,8 @@ export const createSnapshotMetadata = (options: {
   status: extractStatus(options.session),
   live: true,
   externallyDirty: options.externallyDirty,
-  model: serializeModel(options.session.model ?? options.session.state?.model),
-  thinkingLevel: String(options.session.thinkingLevel ?? options.session.state?.thinkingLevel ?? "off"),
+  model: serializeModel(options.session.model ?? options.session.agent?.state?.model),
+  thinkingLevel: String(options.session.thinkingLevel ?? options.session.agent?.state?.thinkingLevel ?? "off"),
   contextUsage: options.contextUsage,
 });
 
@@ -93,7 +108,7 @@ export const createSnapshot = (options: {
   externallyDirty: boolean;
   contextUsage: ApiSessionSnapshot["contextUsage"];
 }): ApiSessionSnapshot => {
-  const messages = serializeMessages(options.session.state?.messages);
+  const messages = serializeMessages(options.session.messages ?? options.session.agent?.state?.messages);
   const sessionFile = options.session.sessionFile ? String(options.session.sessionFile) : undefined;
 
   return {
@@ -150,6 +165,86 @@ const extractTextPart = (part: any): string | undefined => {
   if (typeof part?.content === "string") return part.content;
   if (typeof part?.thinking === "string") return part.thinking;
   return undefined;
+};
+
+const serializeMessageParts = (message: any): ApiMessageContentPart[] => {
+  const content = message?.content;
+  if (typeof content === "string") {
+    return content.trim() ? [{ type: "text", text: content }] : [];
+  }
+
+  if (Array.isArray(content)) {
+    const parts = content
+      .map((part) => serializeMessagePart(part))
+      .filter((part): part is ApiMessageContentPart => Boolean(part));
+
+    if (parts.length > 0) {
+      return parts;
+    }
+  }
+
+  const fallbackText = extractMessageError(message)
+    ?? (typeof message?.result === "string" ? message.result : undefined)
+    ?? (typeof message?.message === "string" ? message.message : undefined);
+
+  return typeof fallbackText === "string" && fallbackText.trim()
+    ? [{ type: "text", text: fallbackText }]
+    : [];
+};
+
+const serializeMessagePart = (part: any): ApiMessageContentPart | undefined => {
+  if (typeof part === "string") {
+    return part.trim() ? { type: "text", text: part } : undefined;
+  }
+
+  if (part?.type === "thinking") {
+    const text = extractTextPart(part)?.trim();
+    return text ? { type: "thinking", text } : undefined;
+  }
+
+  if (part?.type === "toolCall") {
+    const toolName = typeof part?.name === "string" && part.name.trim() ? part.name.trim() : "unknown";
+    const toolCallId = typeof part?.id === "string" && part.id.trim() ? part.id.trim() : undefined;
+    return {
+      type: "toolCall",
+      toolCallId,
+      toolName,
+      arguments: normalizeToolCallArguments(part?.arguments ?? part?.partialJson),
+    };
+  }
+
+  if (part?.type === "image") {
+    const mimeType = typeof part?.source?.mediaType === "string" && part.source.mediaType.trim()
+      ? part.source.mediaType.trim()
+      : typeof part?.mimeType === "string" && part.mimeType.trim()
+        ? part.mimeType.trim()
+        : "unknown";
+    return {
+      type: "image",
+      mimeType,
+    };
+  }
+
+  const text = extractTextPart(part);
+  return text ? { type: "text", text } : undefined;
+};
+
+const normalizeToolCallArguments = (value: unknown): unknown => {
+  if (typeof value !== "string") {
+    return value ?? "";
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (!((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]")))) {
+    return value;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
 };
 
 const formatThinkingPart = (part: any): string => {

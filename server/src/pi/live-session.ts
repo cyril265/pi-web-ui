@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { SessionManager } from "@mariozechner/pi-coding-agent";
 import type {
   ApiExtensionNotification,
   ApiExtensionUiRequest,
@@ -9,7 +8,7 @@ import type {
   ApiToolExecution,
   SessionEvent,
 } from "@pi-web-app/shared";
-import { createSnapshot, createSnapshotMetadata, deriveTitle, serializeMessage, serializeMessages } from "./serialize.js";
+import { createSnapshot, createSnapshotMetadata, serializeMessage } from "./serialize.js";
 
 export type SessionSubscriber = (event: SessionEvent) => void;
 
@@ -43,21 +42,23 @@ export class LiveSession {
       timeoutId: ReturnType<typeof setTimeout> | undefined;
     }
   >();
-  private readonly unsubscribeFromSession: () => void;
+  private unsubscribeFromSession: () => void;
 
   constructor(
-    readonly session: any,
+    session: any,
     sessionManager: any,
+    private readonly reloadPersistedSession: (sessionFile: string) => Promise<void>,
   ) {
+    this.session = session;
     this.sessionManager = sessionManager;
     this.contextUsage = undefined;
+    this.unsubscribeFromSession = () => {};
+    this.subscribeToSession(session);
     this.snapshot = this.createCurrentSnapshot();
-    this.unsubscribeFromSession = session.subscribe((event: any) => {
-      this.handleSessionEvent(event);
-    });
     void this.refreshContextUsage();
   }
 
+  session: any;
   sessionManager: any;
 
   subscribe(subscriber: SessionSubscriber): () => void {
@@ -204,7 +205,9 @@ export class LiveSession {
   }
 
   private upsertSnapshotMessage(message: any, eventType: string) {
-    const fallbackIndex = this.session.state?.messages?.findIndex((candidate: any) => candidate === message) ?? -1;
+    const fallbackIndex = this.session.messages?.findIndex((candidate: any) => candidate === message)
+      ?? this.session.agent?.state?.messages?.findIndex((candidate: any) => candidate === message)
+      ?? -1;
     const messageRole = typeof message?.role === "string" && message.role.trim() ? message.role.trim() : "message";
     const pendingMessageId = this.pendingMessageIds.get(messageRole);
     const messageId = typeof message?.id === "string" && message.id.trim()
@@ -417,23 +420,28 @@ export class LiveSession {
     };
   }
 
+  replaceSession(session: any, sessionManager: any) {
+    const previousSession = this.session;
+    this.unsubscribeFromSession();
+    this.cancelPendingUiRequests();
+
+    this.session = session;
+    this.sessionManager = sessionManager;
+    this.pendingMessageIds.clear();
+    this.pendingMessageSequence = 0;
+    this.toolExecutions.clear();
+    this.contextUsage = undefined;
+
+    this.subscribeToSession(session);
+    previousSession.dispose();
+  }
+
   dispose() {
     if (this.externalReloadTimeout) {
       clearTimeout(this.externalReloadTimeout);
       this.externalReloadTimeout = undefined;
     }
-    for (const [requestId, pendingRequest] of this.pendingUiRequests) {
-      if (pendingRequest.timeoutId) {
-        clearTimeout(pendingRequest.timeoutId);
-      }
-      pendingRequest.resolve({
-        id: requestId,
-        value: undefined,
-        confirmed: undefined,
-        cancelled: true,
-      });
-    }
-    this.pendingUiRequests.clear();
+    this.cancelPendingUiRequests();
     this.subscribers.clear();
     this.unsubscribeFromSession();
     this.session.dispose();
@@ -475,65 +483,28 @@ export class LiveSession {
       return;
     }
 
-    const sessionManager = this.session?.sessionManager ?? this.sessionManager ?? SessionManager.open(sessionFile);
-    if (!sessionManager?.setSessionFile || !sessionManager?.buildSessionContext) {
-      this.sessionManager = SessionManager.open(sessionFile);
-      return;
-    }
-
-    sessionManager.setSessionFile(sessionFile);
-    this.sessionManager = sessionManager;
-
-    this.session._steeringMessages = [];
-    this.session._followUpMessages = [];
-    this.session._pendingNextTurnMessages = [];
-
-    const sessionContext = sessionManager.buildSessionContext();
-
-    if (this.session?.agent) {
-      this.session.agent.sessionId = sessionManager.getSessionId();
-      this.session.agent.replaceMessages(sessionContext.messages ?? []);
-    }
-
-    await this.restoreModelFromSessionContext(sessionContext?.model);
-    this.restoreThinkingLevelFromSessionContext(sessionContext?.thinkingLevel);
+    await this.reloadPersistedSession(sessionFile);
   }
 
-  private async restoreModelFromSessionContext(sessionModel: {
-    provider?: string;
-    modelId?: string;
-  } | undefined) {
-    if (!sessionModel?.provider || !sessionModel?.modelId) {
-      return;
-    }
-
-    const availableModels = await this.session?.modelRegistry?.getAvailable?.();
-    if (!Array.isArray(availableModels)) {
-      return;
-    }
-
-    const matchingModel = availableModels.find((model: any) =>
-      model?.provider === sessionModel.provider && model?.id === sessionModel.modelId
-    );
-
-    if (matchingModel) {
-      this.session.agent?.setModel?.(matchingModel);
-    }
+  private subscribeToSession(session: any) {
+    this.unsubscribeFromSession = session.subscribe((event: any) => {
+      this.handleSessionEvent(event);
+    });
   }
 
-  private restoreThinkingLevelFromSessionContext(thinkingLevel: unknown) {
-    if (typeof thinkingLevel !== "string") {
-      return;
+  private cancelPendingUiRequests() {
+    for (const [requestId, pendingRequest] of this.pendingUiRequests) {
+      if (pendingRequest.timeoutId) {
+        clearTimeout(pendingRequest.timeoutId);
+      }
+      pendingRequest.resolve({
+        id: requestId,
+        value: undefined,
+        confirmed: undefined,
+        cancelled: true,
+      });
     }
-
-    const availableLevels = this.session?.getAvailableThinkingLevels?.();
-    const effectiveThinkingLevel = Array.isArray(availableLevels) && availableLevels.length > 0
-      ? availableLevels.includes(thinkingLevel)
-        ? thinkingLevel
-        : availableLevels[availableLevels.length - 1]
-      : thinkingLevel;
-
-    this.session.agent?.setThinkingLevel?.(effectiveThinkingLevel);
+    this.pendingUiRequests.clear();
   }
 
   private createDialogPromise<T>(

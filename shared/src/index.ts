@@ -14,12 +14,35 @@ export interface ApiImageInput {
   fileName: string;
 }
 
+export type ApiMessageContentPart =
+  | {
+      type: "text";
+      text: string;
+    }
+  | {
+      type: "thinking";
+      text: string;
+    }
+  | {
+      type: "image";
+      mimeType: string;
+    }
+  | {
+      type: "toolCall";
+      toolCallId: string | undefined;
+      toolName: string;
+      arguments: unknown;
+    };
+
 export interface ApiMessage {
   id: string;
   role: string;
   text: string;
   timestamp: string | undefined;
   isError?: boolean;
+  toolCallId?: string;
+  toolName?: string;
+  parts?: ApiMessageContentPart[];
 }
 
 export interface ApiToolExecution {

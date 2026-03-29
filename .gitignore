@@ -1,9 +1,10 @@
+.tmp
+.sift
+
 node_modules/
-.pi/
-.idea/
-.agents/
-.agent/
 dist/
-e2e/.runtime/
 playwright-report/
 test-results/
+e2e/.runtime/
+e2e/fixtures/workspace/.pi/
+*.tsbuildinfo

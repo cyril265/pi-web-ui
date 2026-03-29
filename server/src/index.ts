@@ -211,7 +211,7 @@ app.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId", async (re
 });
 
 app.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId/commands", async (request) => ({
-  commands: sessionRegistry.getSlashCommands(request.params.sessionId),
+  commands: await sessionRegistry.getSlashCommands(request.params.sessionId),
 }));
 
 app.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId/events", async (request, reply) => {

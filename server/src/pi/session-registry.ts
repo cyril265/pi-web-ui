@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import {
   AuthStorage,
   createAgentSession,
+  DefaultResourceLoader,
   ModelRegistry,
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
@@ -18,6 +19,7 @@ import type {
   ApiTreeMessage,
   ThinkingLevel,
 } from "@pi-web-app/shared";
+import { bindSessionExtensions, getRegisteredExtensionCommands } from "./extension-bridge.js";
 import { LiveSession } from "./live-session.js";
 import { deriveTitle, extractMessageText, serializeModel } from "./serialize.js";
 
@@ -91,13 +93,7 @@ export class SessionRegistry {
     }
 
     const sessionManager = SessionManager.create(resolvedCwd, this.sessionDir);
-    const { session } = await createAgentSession({
-      cwd: resolvedCwd,
-      agentDir: this.agentDir,
-      authStorage: this.authStorage,
-      modelRegistry: this.modelRegistry,
-      sessionManager,
-    });
+    const session = await this.createSdkSession(resolvedCwd, sessionManager);
 
     const liveSession = await this.registerSession(session, sessionManager);
     this.pruneInactiveSessions([String(liveSession.session.sessionId)]);
@@ -126,18 +122,11 @@ export class SessionRegistry {
       .sort((left, right) => left.name.localeCompare(right.name));
   }
 
-  getSlashCommands(sessionId: string): ApiSlashCommand[] {
+  async getSlashCommands(sessionId: string): Promise<ApiSlashCommand[]> {
     const liveSession = this.mustGetSession(sessionId);
     const reservedBuiltins = new Set(BUILTIN_SLASH_COMMANDS.map((command) => command.name));
 
-    const registeredExtensionCommands = (liveSession.session.extensionRunner?.getRegisteredCommandsWithPaths() ??
-      []) as Array<{
-        command: {
-          name: string;
-          description?: string;
-        };
-        extensionPath?: string;
-      }>;
+    const registeredExtensionCommands = getRegisteredExtensionCommands(liveSession.session);
     const extensionCommands: ApiSlashCommand[] = registeredExtensionCommands
       .filter(({ command }) => !reservedBuiltins.has(command.name))
       .map(({ command, extensionPath }) =>
@@ -149,13 +138,13 @@ export class SessionRegistry {
         }),
       );
 
-    const promptTemplates = liveSession.session.promptTemplates as Array<{
-      name: string;
-      description?: string;
-      source?: string;
-      filePath?: string;
-    }>;
-    const promptCommands: ApiSlashCommand[] = promptTemplates.map((template) =>
+    const resourceLoader = new DefaultResourceLoader({
+      cwd: this.getSessionCwd(liveSession),
+      agentDir: this.agentDir,
+    });
+    await resourceLoader.reload();
+
+    const promptCommands: ApiSlashCommand[] = resourceLoader.getPrompts().prompts.map((template) =>
       createSlashCommand({
         name: template.name,
         description: template.description,
@@ -165,13 +154,7 @@ export class SessionRegistry {
       }),
     );
 
-    const skills = liveSession.session.resourceLoader.getSkills().skills as Array<{
-      name: string;
-      description?: string;
-      source?: string;
-      filePath?: string;
-    }>;
-    const skillCommands: ApiSlashCommand[] = skills.map((skill) =>
+    const skillCommands: ApiSlashCommand[] = resourceLoader.getSkills().skills.map((skill) =>
       createSlashCommand({
         name: `skill:${skill.name}`,
         description: skill.description,
@@ -181,7 +164,7 @@ export class SessionRegistry {
       }),
     );
 
-    return [...BUILTIN_SLASH_COMMANDS, ...promptCommands, ...extensionCommands, ...skillCommands];
+    return [...BUILTIN_SLASH_COMMANDS, ...extensionCommands, ...promptCommands, ...skillCommands];
   }
 
   prompt(sessionId: string, message: string, images: ApiImageInput[]) {
@@ -316,7 +299,7 @@ export class SessionRegistry {
 
   async reloadSession(sessionId: string) {
     const liveSession = this.mustGetSession(sessionId);
-    await liveSession.session.reload();
+    await this.reloadLiveSessionFromDisk(liveSession);
     liveSession.publishSnapshot();
     return liveSession;
   }
@@ -344,6 +327,53 @@ export class SessionRegistry {
     return liveSession;
   }
 
+  private getSessionCwd(liveSession: LiveSession) {
+    const sessionHeader = liveSession.sessionManager.getHeader?.();
+    if (typeof sessionHeader?.cwd === "string" && sessionHeader.cwd.trim()) {
+      return resolve(sessionHeader.cwd);
+    }
+
+    return this.cwd;
+  }
+
+  private async createSdkSession(cwd: string, sessionManager: PiSessionManager) {
+    const { session } = await createAgentSession({
+      cwd,
+      agentDir: this.agentDir,
+      authStorage: this.authStorage,
+      modelRegistry: this.modelRegistry,
+      sessionManager,
+    });
+
+    return session;
+  }
+
+  private async createOpenedSession(sessionFile: string, liveSession: LiveSession | undefined = undefined) {
+    const sessionManager = SessionManager.open(sessionFile);
+    const sessionHeader = sessionManager.getHeader?.();
+    const sessionCwd = typeof sessionHeader?.cwd === "string" ? resolve(sessionHeader.cwd) : this.cwd;
+    const session = await this.createSdkSession(sessionCwd, sessionManager);
+
+    if (liveSession) {
+      await this.bindSessionToLiveSession(session, liveSession);
+    }
+
+    return { session, sessionManager };
+  }
+
+  private async reloadLiveSessionFromDisk(liveSession: LiveSession, sessionFileOverride?: string) {
+    const sessionFile = sessionFileOverride ?? (liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined);
+    if (!sessionFile) {
+      throw new Error("Only persisted sessions can be reloaded.");
+    }
+
+    const previousSessionId = String(liveSession.session.sessionId);
+    const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
+    const { session, sessionManager } = await this.createOpenedSession(sessionFile, liveSession);
+    liveSession.replaceSession(session, sessionManager);
+    this.syncLiveSessionIdentity(liveSession, previousSessionId, previousSessionFile);
+  }
+
   private async openSessionInternal(sessionFile: string, forceReload: boolean) {
     const existing = this.liveSessionsByPath.get(sessionFile);
     if (existing && !forceReload) {
@@ -356,16 +386,7 @@ export class SessionRegistry {
       existing.dispose();
     }
 
-    const sessionManager = SessionManager.open(sessionFile);
-    const sessionHeader = sessionManager.getHeader?.();
-    const sessionCwd = typeof sessionHeader?.cwd === "string" ? sessionHeader.cwd : undefined;
-    const { session } = await createAgentSession({
-      cwd: typeof sessionCwd === "string" ? resolve(sessionCwd) : this.cwd,
-      agentDir: this.agentDir,
-      authStorage: this.authStorage,
-      modelRegistry: this.modelRegistry,
-      sessionManager,
-    });
+    const { session, sessionManager } = await this.createOpenedSession(sessionFile);
 
     const liveSession = await this.registerSession(session, sessionManager);
     this.pruneInactiveSessions([String(liveSession.session.sessionId)]);
@@ -489,21 +510,32 @@ export class SessionRegistry {
   }
 
   private async registerSession(session: AgentSession, sessionManager: PiSessionManager) {
-    const liveSession = new LiveSession(session, sessionManager);
+    let liveSession!: LiveSession;
+    liveSession = new LiveSession(
+      session,
+      sessionManager,
+      (sessionFile) => this.reloadLiveSessionFromDisk(liveSession, sessionFile),
+    );
     this.liveSessions.set(String(session.sessionId), liveSession);
 
     if (session.sessionFile) {
       this.liveSessionsByPath.set(String(session.sessionFile), liveSession);
     }
 
-    await liveSession.session.bindExtensions({
+    await this.bindSessionToLiveSession(session, liveSession);
+    return liveSession;
+  }
+
+  private async bindSessionToLiveSession(session: AgentSession, liveSession: LiveSession) {
+    await bindSessionExtensions({
+      session,
       uiContext: liveSession.createExtensionUiContext(),
       commandContextActions: {
-        waitForIdle: () => liveSession.session.agent.waitForIdle(),
+        waitForIdle: () => session.agent.waitForIdle(),
         newSession: async (options: any) => {
           const previousSessionId = String(liveSession.session.sessionId);
           const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
-          const success = await liveSession.session.newSession(options);
+          const success = await session.newSession(options);
           if (success) {
             this.syncLiveSessionIdentity(liveSession, previousSessionId, previousSessionFile);
             liveSession.resetAfterSessionMutation();
@@ -513,20 +545,20 @@ export class SessionRegistry {
         fork: async (entryId: string) => {
           const previousSessionId = String(liveSession.session.sessionId);
           const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
-          const result = await liveSession.session.fork(entryId);
+          const result = await session.fork(entryId);
           this.syncLiveSessionIdentity(liveSession, previousSessionId, previousSessionFile);
           liveSession.resetAfterSessionMutation();
           return { cancelled: result.cancelled };
         },
         navigateTree: async (targetId: string, options: any) => {
-          const result = await liveSession.session.navigateTree(targetId, options);
+          const result = await session.navigateTree(targetId, options);
           liveSession.resetAfterSessionMutation();
           return { cancelled: result.cancelled };
         },
         switchSession: async (sessionPath: string) => {
           const previousSessionId = String(liveSession.session.sessionId);
           const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
-          const success = await liveSession.session.switchSession(sessionPath);
+          const success = await session.switchSession(sessionPath);
           if (success) {
             this.syncLiveSessionIdentity(liveSession, previousSessionId, previousSessionFile);
             liveSession.resetAfterSessionMutation();
@@ -534,11 +566,10 @@ export class SessionRegistry {
           return { cancelled: !success };
         },
         reload: async () => {
-          await liveSession.session.reload();
+          await this.reloadLiveSessionFromDisk(liveSession);
           liveSession.publishSnapshot();
         },
       },
-      shutdownHandler: () => {},
       onError: (error: { error: string }) => {
         liveSession.publish({
           type: "error",
@@ -546,8 +577,6 @@ export class SessionRegistry {
         });
       },
     });
-
-    return liveSession;
   }
 
   private unregisterLiveSession(liveSession: LiveSession) {
