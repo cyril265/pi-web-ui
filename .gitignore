@@ -4,3 +4,6 @@ node_modules/
 .agents/
 .agent/
 dist/
+e2e/.runtime/
+playwright-report/
+test-results/

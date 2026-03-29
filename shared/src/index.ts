@@ -19,6 +19,7 @@ export interface ApiMessage {
   role: string;
   text: string;
   timestamp: string | undefined;
+  isError?: boolean;
 }
 
 export interface ApiToolExecution {
@@ -57,6 +58,12 @@ export interface ApiSessionListItem {
   externallyDirty: boolean;
 }
 
+export interface ApiContextUsage {
+  tokens: number;
+  contextWindow: number;
+  percent: number;
+}
+
 export interface ApiSessionSnapshot {
   sessionId: string;
   sessionFile: string | undefined;
@@ -66,8 +73,20 @@ export interface ApiSessionSnapshot {
   externallyDirty: boolean;
   model: ApiModelInfo | undefined;
   thinkingLevel: ThinkingLevel;
+  contextUsage: ApiContextUsage | undefined;
   messages: ApiMessage[];
   toolExecutions: ApiToolExecution[];
+}
+
+export interface ApiSessionPatch {
+  sessionFile?: string | undefined;
+  title?: string;
+  status?: SessionStatus;
+  live?: boolean;
+  externallyDirty?: boolean;
+  model?: ApiModelInfo | undefined;
+  thinkingLevel?: ThinkingLevel;
+  contextUsage?: ApiContextUsage | undefined;
 }
 
 export type ApiSlashCommandSource = "builtin" | "extension" | "prompt" | "skill";
@@ -142,6 +161,19 @@ export type SessionEvent =
   | {
       type: "snapshot";
       snapshot: ApiSessionSnapshot;
+    }
+  | {
+      type: "session_patch";
+      patch: ApiSessionPatch;
+    }
+  | {
+      type: "messages_delta";
+      fromIndex: number;
+      messages: ApiMessage[];
+    }
+  | {
+      type: "tool_execution_delta";
+      toolExecution: ApiToolExecution;
     }
   | {
       type: "error";

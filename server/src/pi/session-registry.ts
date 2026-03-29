@@ -23,6 +23,8 @@ import { deriveTitle, extractMessageText, serializeModel } from "./serialize.js"
 
 const INTERNAL_CHANGE_WINDOW_MS = 300;
 
+const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
+
 const normalizeSlashCommandLocation = (source: unknown): ApiSlashCommand["location"] =>
   source === "user" || source === "project" || source === "path" ? source : undefined;
 
@@ -81,10 +83,16 @@ export class SessionRegistry {
       .sort((left, right) => (right.lastModified ?? "").localeCompare(left.lastModified ?? ""));
   }
 
-  async createSession() {
-    const sessionManager = SessionManager.create(this.cwd, this.sessionDir);
+  async createSession(targetCwd = this.cwd) {
+    const resolvedCwd = resolve(this.cwd, targetCwd);
+    const targetStats = await stat(resolvedCwd).catch(() => undefined);
+    if (!targetStats?.isDirectory()) {
+      throw new Error(`Directory not found: ${resolvedCwd}`);
+    }
+
+    const sessionManager = SessionManager.create(resolvedCwd, this.sessionDir);
     const { session } = await createAgentSession({
-      cwd: this.cwd,
+      cwd: resolvedCwd,
       agentDir: this.agentDir,
       authStorage: this.authStorage,
       modelRegistry: this.modelRegistry,
@@ -176,31 +184,50 @@ export class SessionRegistry {
     return [...BUILTIN_SLASH_COMMANDS, ...promptCommands, ...extensionCommands, ...skillCommands];
   }
 
-  async prompt(sessionId: string, message: string, images: ApiImageInput[]) {
+  prompt(sessionId: string, message: string, images: ApiImageInput[]) {
     const liveSession = this.mustGetSession(sessionId);
-    await liveSession.session.prompt(message, images.length > 0 ? { images: images.map(toSdkImage) } : undefined);
+    void liveSession.session.prompt(message, images.length > 0 ? { images: images.map(toSdkImage) } : undefined)
+      .catch((error: unknown) => {
+        liveSession.publish({
+          type: "error",
+          message: getErrorMessage(error),
+        });
+        liveSession.publishSnapshot();
+      });
   }
 
-  async steer(sessionId: string, message: string) {
+  steer(sessionId: string, message: string) {
     const liveSession = this.mustGetSession(sessionId);
-    await liveSession.session.steer(message);
+    void liveSession.session.steer(message).catch((error: unknown) => {
+      liveSession.publish({
+        type: "error",
+        message: getErrorMessage(error),
+      });
+      liveSession.publishSnapshot();
+    });
   }
 
-  async followUp(sessionId: string, message: string) {
+  followUp(sessionId: string, message: string) {
     const liveSession = this.mustGetSession(sessionId);
-    await liveSession.session.followUp(message);
+    void liveSession.session.followUp(message).catch((error: unknown) => {
+      liveSession.publish({
+        type: "error",
+        message: getErrorMessage(error),
+      });
+      liveSession.publishSnapshot();
+    });
   }
 
   async abort(sessionId: string) {
     const liveSession = this.mustGetSession(sessionId);
     await liveSession.session.abort();
-    liveSession.publishSnapshot();
+    liveSession.publishSessionPatch();
   }
 
   async cycleModel(sessionId: string) {
     const liveSession = this.mustGetSession(sessionId);
     await liveSession.session.cycleModel();
-    liveSession.publishSnapshot();
+    liveSession.publishSessionPatch();
   }
 
   async setModel(sessionId: string, provider: string, modelId: string) {
@@ -211,7 +238,7 @@ export class SessionRegistry {
     }
 
     await liveSession.session.setModel(model);
-    liveSession.publishSnapshot();
+    liveSession.publishSessionPatch();
   }
 
   async compactSession(sessionId: string, instructions?: string) {
@@ -224,13 +251,13 @@ export class SessionRegistry {
   setThinkingLevel(sessionId: string, thinkingLevel: ThinkingLevel) {
     const liveSession = this.mustGetSession(sessionId);
     liveSession.session.setThinkingLevel(thinkingLevel);
-    liveSession.publishSnapshot();
+    liveSession.publishSessionPatch();
   }
 
   renameSession(sessionId: string, name: string) {
     const liveSession = this.mustGetSession(sessionId);
     liveSession.sessionManager.appendSessionInfo(name.trim());
-    liveSession.publishSnapshot();
+    liveSession.publishSessionPatch();
     return liveSession;
   }
 

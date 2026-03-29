@@ -1,6 +1,9 @@
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
+import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import Fastify from "fastify";
@@ -12,9 +15,114 @@ const port = Number(process.env.PORT ?? 3001);
 const currentDir = dirname(fileURLToPath(import.meta.url));
 const cwd = resolve(process.env.PI_WORKSPACE_DIR ?? resolve(currentDir, "../.."));
 const clientDist = resolve(currentDir, "../../client/dist");
+const clipboardImagePathPattern = /(?:^|\/)pi-clipboard-[\w-]+\.(png|jpe?g|gif|webp)$/i;
+const clipboardImageMimeTypes: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+};
 
 const sessionRegistry = new SessionRegistry(cwd);
 const app = Fastify({ logger: true });
+const execFileAsync = promisify(execFile);
+
+type ExecFileError = Error & {
+  code?: string | number;
+  stderr?: string;
+};
+
+const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
+
+const isExecFileError = (error: unknown): error is ExecFileError => error instanceof Error;
+
+const isDirectoryPickerCancelled = (error: unknown) => {
+  if (!isExecFileError(error)) {
+    return false;
+  }
+
+  const message = `${error.message}\n${error.stderr ?? ""}`.toLowerCase();
+  return error.code === 1 || error.code === "1" || message.includes("user canceled") || message.includes("canceled");
+};
+
+const escapeAppleScriptString = (value: string) => value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+const escapePowerShellString = (value: string) => value.replaceAll("'", "''");
+
+async function selectDirectory(initialPath?: string) {
+  const defaultPath = initialPath?.trim() ? resolve(cwd, initialPath.trim()) : cwd;
+
+  if (process.platform === "darwin") {
+    const script = `
+set defaultLocation to POSIX file "/" as alias
+try
+  set defaultLocation to POSIX file "${escapeAppleScriptString(defaultPath)}" as alias
+end try
+set chosenFolder to choose folder with prompt "Select a project directory" default location defaultLocation
+POSIX path of chosenFolder
+`;
+
+    try {
+      const { stdout } = await execFileAsync("osascript", ["-e", script]);
+      return stdout.trim() || undefined;
+    } catch (error) {
+      if (isDirectoryPickerCancelled(error)) {
+        return undefined;
+      }
+      throw new Error(`Failed to open the macOS directory picker: ${getErrorMessage(error)}`);
+    }
+  }
+
+  if (process.platform === "win32") {
+    const script = [
+      "Add-Type -AssemblyName System.Windows.Forms",
+      "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
+      "$dialog.Description = 'Select a project directory'",
+      `$dialog.SelectedPath = '${escapePowerShellString(defaultPath)}'`,
+      "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }",
+    ].join("; ");
+
+    try {
+      const { stdout } = await execFileAsync("powershell", ["-NoProfile", "-STA", "-Command", script]);
+      return stdout.trim() || undefined;
+    } catch (error) {
+      if (isDirectoryPickerCancelled(error)) {
+        return undefined;
+      }
+      throw new Error(`Failed to open the Windows directory picker: ${getErrorMessage(error)}`);
+    }
+  }
+
+  try {
+    const { stdout } = await execFileAsync("zenity", [
+      "--file-selection",
+      "--directory",
+      "--title=Select a project directory",
+      `--filename=${defaultPath.endsWith("/") ? defaultPath : `${defaultPath}/`}`,
+    ]);
+    return stdout.trim() || undefined;
+  } catch (error) {
+    if (isDirectoryPickerCancelled(error)) {
+      return undefined;
+    }
+    if (isExecFileError(error) && error.code !== "ENOENT") {
+      throw new Error(`Failed to open the Linux directory picker: ${getErrorMessage(error)}`);
+    }
+  }
+
+  try {
+    const { stdout } = await execFileAsync("kdialog", ["--getexistingdirectory", defaultPath, "--title", "Select a project directory"]);
+    return stdout.trim() || undefined;
+  } catch (error) {
+    if (isDirectoryPickerCancelled(error)) {
+      return undefined;
+    }
+    if (isExecFileError(error) && error.code === "ENOENT") {
+      throw new Error("No supported directory picker found. Paste a path manually.");
+    }
+    throw new Error(`Failed to open the Linux directory picker: ${getErrorMessage(error)}`);
+  }
+}
 
 await app.register(cors, {
   origin: true,
@@ -31,15 +139,57 @@ app.get("/api/models", async () => ({
   models: await sessionRegistry.getAvailableModels(),
 }));
 
+app.post<{ Body: { path: string } }>("/api/clipboard-image", async (request, reply) => {
+  const imagePath = request.body.path.trim();
+  if (!clipboardImagePathPattern.test(imagePath)) {
+    return reply.code(400).send({ message: "Unsupported clipboard image path" });
+  }
+
+  const extension = imagePath.split(".").at(-1)?.toLowerCase();
+  const mimeType = extension ? clipboardImageMimeTypes[extension] : undefined;
+  if (!mimeType) {
+    return reply.code(400).send({ message: "Unsupported clipboard image type" });
+  }
+
+  try {
+    const data = (await readFile(imagePath)).toString("base64");
+    return {
+      attachment: {
+        fileName: basename(imagePath),
+        mimeType,
+        data,
+      },
+    };
+  } catch {
+    return reply.code(404).send({ message: "Clipboard image not found" });
+  }
+});
+
 app.get<{ Querystring: { scope?: "current" | "all" } }>("/api/sessions", async (request) => ({
   sessions: await sessionRegistry.listSessions(request.query.scope === "all" ? "all" : "current"),
 }));
 
-app.post("/api/sessions", async () => {
-  const liveSession = await sessionRegistry.createSession();
-  return {
-    snapshot: liveSession.getSnapshot(),
-  };
+app.post<{ Body: { initialPath?: string } }>("/api/directories/select", async (request, reply) => {
+  try {
+    const path = await selectDirectory(request.body?.initialPath);
+    return {
+      cancelled: !path,
+      path,
+    };
+  } catch (error) {
+    return reply.code(500).type("text/plain").send(getErrorMessage(error));
+  }
+});
+
+app.post<{ Body: { path?: string } }>("/api/sessions", async (request, reply) => {
+  try {
+    const liveSession = await sessionRegistry.createSession(request.body?.path);
+    return {
+      snapshot: liveSession.getSnapshot(),
+    };
+  } catch (error) {
+    return reply.code(400).type("text/plain").send(getErrorMessage(error));
+  }
 });
 
 app.post<{ Body: { path: string } }>("/api/sessions/open", async (request) => {

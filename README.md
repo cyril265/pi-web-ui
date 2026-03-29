@@ -44,6 +44,22 @@ Optional environment variables:
 - `PI_AGENT_DIR` - override pi config dir, default `~/.pi/agent`
 - `PI_WORKSPACE_DIR` - override workspace cwd used by the pi session runtime
 
+## End-to-end smoke harness
+
+The Playwright harness runs the built app against the real Fastify server with repo-local runtime fixtures:
+
+```bash
+bun run e2e:install
+bun run e2e
+```
+
+`bun run e2e:prepare` materializes deterministic runtime data under `e2e/.runtime/` from tracked fixtures in `e2e/fixtures/`, then the Playwright `webServer` starts the real app with:
+
+- `PI_AGENT_DIR=$REPO/e2e/.runtime/agent`
+- `PI_WORKSPACE_DIR=$REPO/e2e/.runtime/workspace`
+- `HOST=127.0.0.1`
+- `PORT=3310`
+
 ## Current scope
 
 Implemented today:
@@ -59,6 +75,7 @@ Implemented today:
 - session browsing across all `~/.pi/agent` workspaces
 - external-change warnings with reload-from-disk recovery
 - improved message and tool rendering
+- per-message copy / retry / edit / fork actions with safe fork-based semantics
 - UX polish for mobile interaction: clearer header, stronger focus states, sheet close buttons, and loading skeletons
 - extension UI parity for confirm / input / select / editor / notify / status / widget / editor prefill / title
 - live SSE updates

@@ -4,12 +4,21 @@ import type {
   ApiExtensionNotification,
   ApiExtensionUiRequest,
   ApiExtensionUiResponse,
+  ApiSessionPatch,
+  ApiSessionSnapshot,
   ApiToolExecution,
   SessionEvent,
 } from "@pi-web-app/shared";
-import { createSnapshot } from "./serialize.js";
+import { createSnapshot, createSnapshotMetadata, deriveTitle, serializeMessage, serializeMessages } from "./serialize.js";
 
 export type SessionSubscriber = (event: SessionEvent) => void;
+
+function normalizeExtensionWidgetContent(content: unknown): string[] | undefined {
+  if (content == null) return undefined;
+  if (typeof content === "string") return [content];
+  if (!Array.isArray(content)) return undefined;
+  return content.filter((line): line is string => typeof line === "string");
+}
 
 export class LiveSession {
   readonly subscribers = new Set<SessionSubscriber>();
@@ -18,6 +27,12 @@ export class LiveSession {
   externallyDirty = false;
   lastInternalUpdateAt = Date.now();
 
+  private snapshot: ApiSessionSnapshot;
+  private contextUsage: ApiSessionSnapshot["contextUsage"];
+  private isRefreshingContextUsage = false;
+  private hasPendingContextUsageRefresh = false;
+  private pendingMessageSequence = 0;
+  private readonly pendingMessageIds = new Map<string, string>();
   private externalReloadTimeout: ReturnType<typeof setTimeout> | undefined;
   private isReloadingExternally = false;
   private hasPendingExternalReload = false;
@@ -35,9 +50,12 @@ export class LiveSession {
     sessionManager: any,
   ) {
     this.sessionManager = sessionManager;
+    this.contextUsage = undefined;
+    this.snapshot = this.createCurrentSnapshot();
     this.unsubscribeFromSession = session.subscribe((event: any) => {
       this.handleSessionEvent(event);
     });
+    void this.refreshContextUsage();
   }
 
   sessionManager: any;
@@ -51,12 +69,7 @@ export class LiveSession {
   }
 
   getSnapshot() {
-    return createSnapshot({
-      session: this.session,
-      sessionName: this.getSessionName(),
-      toolExecutions: this.toolExecutions,
-      externallyDirty: this.externallyDirty,
-    });
+    return this.snapshot;
   }
 
   getSessionName(): string | undefined {
@@ -66,25 +79,32 @@ export class LiveSession {
   }
 
   publishSnapshot(markInternalUpdate = true) {
-    if (markInternalUpdate) {
-      this.lastInternalUpdateAt = Date.now();
-    }
+    this.markInternalUpdate(markInternalUpdate);
+    this.snapshot = this.createCurrentSnapshot();
     this.publish({
       type: "snapshot",
-      snapshot: this.getSnapshot(),
+      snapshot: this.snapshot,
     });
+    void this.refreshContextUsage();
+  }
+
+  publishSessionPatch(markInternalUpdate = true) {
+    this.markInternalUpdate(markInternalUpdate);
+    const patch = this.syncSnapshotMetadata();
+    if (patch) {
+      this.publish({
+        type: "session_patch",
+        patch,
+      });
+    }
+    void this.refreshContextUsage();
   }
 
   markExternalChange() {
     this.externallyDirty = true;
     this.hasPendingExternalReload = true;
-    if (this.externalReloadTimeout) {
-      clearTimeout(this.externalReloadTimeout);
-    }
-    this.externalReloadTimeout = setTimeout(() => {
-      this.externalReloadTimeout = undefined;
-      void this.reloadExternalChanges();
-    }, 150);
+    this.publishSessionPatch(false);
+    this.scheduleExternalReload();
   }
 
   resetAfterSessionMutation() {
@@ -97,6 +117,170 @@ export class LiveSession {
     for (const subscriber of this.subscribers) {
       subscriber(event);
     }
+  }
+
+  private createCurrentSnapshot() {
+    return createSnapshot({
+      session: this.session,
+      sessionName: this.getSessionName(),
+      toolExecutions: this.toolExecutions,
+      externallyDirty: this.externallyDirty,
+      contextUsage: this.contextUsage,
+    });
+  }
+
+  private markInternalUpdate(markInternalUpdate: boolean) {
+    if (markInternalUpdate) {
+      this.lastInternalUpdateAt = Date.now();
+    }
+  }
+
+  private scheduleExternalReload() {
+    if (this.externalReloadTimeout) {
+      clearTimeout(this.externalReloadTimeout);
+    }
+    this.externalReloadTimeout = setTimeout(() => {
+      this.externalReloadTimeout = undefined;
+      void this.reloadExternalChanges();
+    }, 150);
+  }
+
+  private syncSnapshotMetadata(): ApiSessionPatch | undefined {
+    const nextSessionFile = this.session.sessionFile ? String(this.session.sessionFile) : undefined;
+    const nextMetadata = createSnapshotMetadata({
+      session: this.session,
+      sessionName: this.getSessionName(),
+      sessionFile: nextSessionFile ?? this.snapshot.sessionFile,
+      messages: this.snapshot.messages,
+      externallyDirty: this.externallyDirty,
+      contextUsage: this.contextUsage,
+    });
+    const patch: ApiSessionPatch = {};
+
+    if (nextSessionFile !== this.snapshot.sessionFile) {
+      this.snapshot.sessionFile = nextSessionFile;
+      patch.sessionFile = nextSessionFile;
+    }
+    if (nextMetadata.title !== this.snapshot.title) {
+      this.snapshot.title = nextMetadata.title;
+      patch.title = nextMetadata.title;
+    }
+    if (nextMetadata.status !== this.snapshot.status) {
+      this.snapshot.status = nextMetadata.status;
+      patch.status = nextMetadata.status;
+    }
+    if (nextMetadata.live !== this.snapshot.live) {
+      this.snapshot.live = nextMetadata.live;
+      patch.live = nextMetadata.live;
+    }
+    if (nextMetadata.externallyDirty !== this.snapshot.externallyDirty) {
+      this.snapshot.externallyDirty = nextMetadata.externallyDirty;
+      patch.externallyDirty = nextMetadata.externallyDirty;
+    }
+    if (!modelsEqual(nextMetadata.model, this.snapshot.model)) {
+      this.snapshot.model = nextMetadata.model;
+      patch.model = nextMetadata.model;
+    }
+    if (nextMetadata.thinkingLevel !== this.snapshot.thinkingLevel) {
+      this.snapshot.thinkingLevel = nextMetadata.thinkingLevel;
+      patch.thinkingLevel = nextMetadata.thinkingLevel;
+    }
+    if (!contextUsageEqual(nextMetadata.contextUsage, this.snapshot.contextUsage)) {
+      this.snapshot.contextUsage = nextMetadata.contextUsage;
+      patch.contextUsage = nextMetadata.contextUsage;
+    }
+
+    return Object.keys(patch).length > 0 ? patch : undefined;
+  }
+
+  private publishMessagesDelta(fromIndex: number, markInternalUpdate = true) {
+    this.markInternalUpdate(markInternalUpdate);
+    this.publish({
+      type: "messages_delta",
+      fromIndex,
+      messages: this.snapshot.messages.slice(fromIndex),
+    });
+  }
+
+  private upsertSnapshotMessage(message: any, eventType: string) {
+    const fallbackIndex = this.session.state?.messages?.findIndex((candidate: any) => candidate === message) ?? -1;
+    const messageRole = typeof message?.role === "string" && message.role.trim() ? message.role.trim() : "message";
+    const pendingMessageId = this.pendingMessageIds.get(messageRole);
+    const messageId = typeof message?.id === "string" && message.id.trim()
+      ? message.id.trim()
+      : fallbackIndex >= 0
+        ? `${messageRole}-${fallbackIndex}`
+        : pendingMessageId ?? `pending-${messageRole}-${this.pendingMessageSequence++}`;
+
+    if (!pendingMessageId && fallbackIndex < 0) {
+      this.pendingMessageIds.set(messageRole, messageId);
+    }
+
+    const serializedMessage = serializeMessage(message, Math.max(fallbackIndex, 0));
+    if (serializedMessage) {
+      serializedMessage.id = messageId;
+    }
+
+    let existingIndex = this.snapshot.messages.findIndex((entry) => entry.id === messageId);
+    if (existingIndex === -1 && pendingMessageId && pendingMessageId !== messageId) {
+      existingIndex = this.snapshot.messages.findIndex((entry) => entry.id === pendingMessageId);
+    }
+
+    if (!serializedMessage) {
+      if (eventType === "message_end") {
+        this.pendingMessageIds.delete(messageRole);
+      }
+      if (existingIndex === -1) {
+        return "none" as const;
+      }
+      this.snapshot.messages = [
+        ...this.snapshot.messages.slice(0, existingIndex),
+        ...this.snapshot.messages.slice(existingIndex + 1),
+      ];
+      this.publishMessagesDelta(existingIndex);
+      return "delta" as const;
+    }
+
+    if (existingIndex === -1) {
+      this.snapshot.messages = [...this.snapshot.messages, serializedMessage];
+      this.publishMessagesDelta(this.snapshot.messages.length - 1);
+    } else {
+      const current = this.snapshot.messages[existingIndex];
+      if (
+        current?.id === serializedMessage.id &&
+        current.role === serializedMessage.role &&
+        current.text === serializedMessage.text &&
+        current.timestamp === serializedMessage.timestamp
+      ) {
+        if (fallbackIndex >= 0 || eventType === "message_end") {
+          this.pendingMessageIds.delete(messageRole);
+        }
+        return "none" as const;
+      }
+
+      this.snapshot.messages = [
+        ...this.snapshot.messages.slice(0, existingIndex),
+        serializedMessage,
+        ...this.snapshot.messages.slice(existingIndex + 1),
+      ];
+      this.publishMessagesDelta(existingIndex);
+    }
+
+    if (fallbackIndex >= 0 || eventType === "message_end") {
+      this.pendingMessageIds.delete(messageRole);
+    }
+    return "delta" as const;
+  }
+
+  private publishToolExecutionDelta(toolExecution: ApiToolExecution, markInternalUpdate = true) {
+    this.markInternalUpdate(markInternalUpdate);
+    this.snapshot.toolExecutions = [...this.toolExecutions.values()].sort((left, right) =>
+      left.startedAt.localeCompare(right.startedAt),
+    );
+    this.publish({
+      type: "tool_execution_delta",
+      toolExecution,
+    });
   }
 
   respondToUiRequest(response: ApiExtensionUiResponse) {
@@ -190,14 +374,15 @@ export class LiveSession {
         });
       },
       setWorkingMessage: () => {},
-      setWidget: (key: string, content?: string[], options?: { placement?: "aboveEditor" | "belowEditor" }) => {
+      setWidget: (key: string, content?: string | readonly string[], options?: { placement?: "aboveEditor" | "belowEditor" }) => {
+        const normalizedContent = normalizeExtensionWidgetContent(content);
         this.publish({
           type: "set_widget",
           key,
-          widget: content
+          widget: normalizedContent
             ? {
                 key,
-                lines: content,
+                lines: normalizedContent,
                 placement: options?.placement ?? "aboveEditor",
               }
             : undefined,
@@ -257,6 +442,10 @@ export class LiveSession {
     if (this.isReloadingExternally) {
       return;
     }
+    if (this.session.isStreaming) {
+      this.scheduleExternalReload();
+      return;
+    }
 
     this.isReloadingExternally = true;
     try {
@@ -274,10 +463,7 @@ export class LiveSession {
     } finally {
       this.isReloadingExternally = false;
       if (this.hasPendingExternalReload && !this.externalReloadTimeout) {
-        this.externalReloadTimeout = setTimeout(() => {
-          this.externalReloadTimeout = undefined;
-          void this.reloadExternalChanges();
-        }, 150);
+        this.scheduleExternalReload();
       }
     }
   }
@@ -411,18 +597,59 @@ export class LiveSession {
     });
   }
 
+  private async refreshContextUsage() {
+    if (typeof this.session.getContextUsage !== "function") {
+      return;
+    }
+    if (this.isRefreshingContextUsage) {
+      this.hasPendingContextUsageRefresh = true;
+      return;
+    }
+
+    this.isRefreshingContextUsage = true;
+    try {
+      do {
+        this.hasPendingContextUsageRefresh = false;
+        const nextContextUsage = normalizeContextUsage(await this.session.getContextUsage());
+        this.contextUsage = nextContextUsage;
+
+        if (!contextUsageEqual(nextContextUsage, this.snapshot.contextUsage)) {
+          this.snapshot.contextUsage = nextContextUsage;
+          this.publish({
+            type: "session_patch",
+            patch: { contextUsage: nextContextUsage },
+          });
+        }
+      } while (this.hasPendingContextUsageRefresh);
+    } catch {
+      this.hasPendingContextUsageRefresh = false;
+    } finally {
+      this.isRefreshingContextUsage = false;
+    }
+  }
+
   private handleSessionEvent(event: any) {
     switch (event.type) {
+      case "message_start":
+      case "message_update":
+      case "message_end": {
+        if (event.message) {
+          this.upsertSnapshotMessage(event.message, event.type);
+        }
+        break;
+      }
       case "tool_execution_start": {
         const now = new Date().toISOString();
-        this.toolExecutions.set(String(event.toolCallId), {
+        const toolExecution: ApiToolExecution = {
           toolCallId: String(event.toolCallId),
           toolName: String(event.toolName),
           status: "running",
           text: "",
           startedAt: now,
           updatedAt: now,
-        });
+        };
+        this.toolExecutions.set(toolExecution.toolCallId, toolExecution);
+        this.publishToolExecutionDelta(toolExecution);
         break;
       }
       case "tool_execution_update": {
@@ -430,6 +657,7 @@ export class LiveSession {
         if (current) {
           current.text = stringifyToolOutput(event.partialResult);
           current.updatedAt = new Date().toISOString();
+          this.publishToolExecutionDelta(current);
         }
         break;
       }
@@ -439,16 +667,52 @@ export class LiveSession {
           current.status = event.isError ? "error" : "done";
           current.text = stringifyToolOutput(event.result);
           current.updatedAt = new Date().toISOString();
+          this.publishToolExecutionDelta(current);
         }
         break;
+      }
+      case "auto_compaction_end": {
+        this.publishSnapshot();
+        return;
       }
       default:
         break;
     }
 
-    this.publishSnapshot();
+    this.publishSessionPatch();
   }
 }
+
+const modelsEqual = (left: ApiSessionSnapshot["model"], right: ApiSessionSnapshot["model"]) =>
+  left?.provider === right?.provider && left?.id === right?.id && left?.name === right?.name;
+
+const contextUsageEqual = (
+  left: ApiSessionSnapshot["contextUsage"],
+  right: ApiSessionSnapshot["contextUsage"],
+) =>
+  left?.tokens === right?.tokens
+  && left?.contextWindow === right?.contextWindow
+  && left?.percent === right?.percent;
+
+const normalizeContextUsage = (contextUsage: unknown): ApiSessionSnapshot["contextUsage"] => {
+  if (!contextUsage || typeof contextUsage !== "object") {
+    return undefined;
+  }
+
+  const tokens = Number((contextUsage as { tokens?: unknown }).tokens);
+  const contextWindow = Number((contextUsage as { contextWindow?: unknown }).contextWindow);
+  const percent = Number((contextUsage as { percent?: unknown }).percent);
+
+  if (!Number.isFinite(tokens) || !Number.isFinite(contextWindow) || !Number.isFinite(percent)) {
+    return undefined;
+  }
+
+  return {
+    tokens,
+    contextWindow,
+    percent,
+  };
+};
 
 const stringifyToolOutput = (value: unknown): string => {
   if (typeof value === "string") return value;
