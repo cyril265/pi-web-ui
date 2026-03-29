@@ -633,6 +633,12 @@ button:not(:disabled) {
   min-width: 0;
 }
 
+.pp-message-shell-assistant > .pp-message-surface,
+.pp-message-shell-extension > .pp-message-surface {
+  width: 100%;
+  align-self: stretch;
+}
+
 .pp-message-row {
   display: flex;
   margin-bottom: var(--pp-message-row-gap);
@@ -722,6 +728,8 @@ button:not(:disabled) {
 
 .pp-msg-assistant {
   margin-bottom: 0;
+  width: 100%;
+  min-width: 0;
   font-size: var(--pp-message-font-size);
   line-height: var(--pp-assistant-line-height);
   color: var(--pp-text);
