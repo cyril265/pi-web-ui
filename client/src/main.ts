@@ -3254,8 +3254,8 @@ const template = () => {
     ? activeSessionListItem?.cwd ?? getSessionDirectoryOverride(state.activeSession)
     : undefined;
   const workspaceLabel = sessionCwd ? shortenCwd(sessionCwd) : undefined;
-  const lastUpdatedLabel = activeSessionListItem?.lastModified ? timeAgo(activeSessionListItem.lastModified) : undefined;
   const contextUsageLabel = formatContextUsage(state.activeSession?.contextUsage);
+  const runningToolCount = state.activeSession?.toolExecutions.filter((tool) => tool.status === "running").length ?? 0;
 
   return html`
   <div class="pp-shell pp-shell-${state.displayMode}" data-display-mode=${state.displayMode}>
@@ -3340,6 +3340,22 @@ const template = () => {
 
         ${renderExtensionWidgets("aboveEditor")}
 
+        ${state.activeSession?.status === "streaming"
+          ? html`
+              <div class="pp-session-activity-shell">
+                <div class="pp-session-activity">
+                  <span class="pp-session-activity-dot" aria-hidden="true"></span>
+                  <span class="pp-session-activity-text">
+                    Agent working…
+                    ${runningToolCount > 0
+                      ? ` ${runningToolCount} tool${runningToolCount === 1 ? "" : "s"} running.`
+                      : ""}
+                  </span>
+                </div>
+              </div>
+            `
+          : nothing}
+
         <!-- Composer -->
         <div class="pp-composer-shell">
           ${renderSlashCommandPalette()}
@@ -3410,9 +3426,6 @@ const template = () => {
             ${workspaceLabel
               ? html`<span class="pp-statusbar-detail" title=${sessionCwd}>${workspaceLabel}</span>`
               : nothing}
-            ${lastUpdatedLabel
-              ? html`<span class="pp-statusbar-detail">Updated ${lastUpdatedLabel}</span>`
-              : nothing}
             ${contextUsageLabel && state.activeSession?.contextUsage
               ? html`
                   <span
@@ -3421,20 +3434,8 @@ const template = () => {
                   >${contextUsageLabel}</span>
                 `
               : nothing}
-            ${state.showTokenUsage && state.activeSession
-              ? html`<span class="pp-statusbar-stats">${renderedMessages.length} msgs</span>`
-              : nothing}
           </div>
           <div class="pp-statusbar-actions">
-            ${state.activeSession
-              ? html`<span class="pp-live-state ${state.liveConnectionState}">
-                  ${state.liveConnectionState === "connected"
-                    ? "Live"
-                    : state.liveConnectionState === "reconnecting"
-                      ? "Reconnecting\u2026"
-                      : "Connecting\u2026"}
-                </span>`
-              : nothing}
             ${state.extensionStatuses.map(
               (s) => html`<span style="font-size:0.6875rem;">${s.key}: ${s.text}</span>`,
             )}
@@ -3480,6 +3481,11 @@ function renderSidebarItem(session: ApiSessionListItem) {
   const isActive = state.switchingSessionId
     ? isSwitching
     : state.activeSession?.sessionId === session.id;
+  const statusClass = session.status === "streaming"
+    ? "working"
+    : session.live
+      ? "live"
+      : "idle";
   return html`
     <button
       class="pp-session-item ${isActive ? "active" : ""} ${isSwitching ? "loading" : ""}"
@@ -3487,9 +3493,14 @@ function renderSidebarItem(session: ApiSessionListItem) {
       ?disabled=${isSwitching}
       aria-busy=${String(isSwitching)}
     >
-      <div class="pp-session-dot ${session.live || session.status === 'streaming' ? 'live' : 'idle'}"></div>
+      <div class="pp-session-dot ${statusClass}"></div>
       <div class="pp-session-info">
-        <div class="pp-session-title">${truncate(session.title, 60)}</div>
+        <div class="pp-session-title-row">
+          <div class="pp-session-title">${truncate(session.title, 60)}</div>
+          ${session.status === "streaming"
+            ? html`<span class="pp-session-status-chip">Working</span>`
+            : nothing}
+        </div>
         <div class="pp-session-meta">
           <span class="pp-session-time">${isSwitching ? "Opening…" : timeAgo(session.lastModified)}</span>
           <span class="pp-session-badge">${session.messageCount}</span>

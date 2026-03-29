@@ -69,6 +69,7 @@ export class LiveSession {
   }
 
   getSnapshot() {
+    this.syncSnapshotMetadata();
     return this.snapshot;
   }
 
