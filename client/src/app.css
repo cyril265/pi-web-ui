@@ -741,6 +741,11 @@ button:not(:disabled) {
   }
 
   .pp-message-actions {
+    opacity: 0;
+    visibility: hidden;
+  }
+
+  .pp-message-row.pp-actions-visible .pp-message-actions {
     opacity: 1;
     visibility: visible;
   }

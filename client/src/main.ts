@@ -653,6 +653,12 @@ async function sendComposer() {
   const parsedSlashCommand = parseSlashCommandInput(submittedText);
   const slashCommand = parsedSlashCommand ? getSlashCommandByName(parsedSlashCommand.name) : undefined;
 
+  if (!slashCommand && composerMode === "prompt" && !activeSession.model) {
+    state.error = "No model is selected. Open the model picker to choose one before sending.";
+    requestRender();
+    return;
+  }
+
   if (slashCommand?.source === "extension" && composerMode !== "prompt") {
     state.error = `/${slashCommand.name} must be sent in prompt mode.`;
     requestRender();
@@ -2964,6 +2970,23 @@ async function getMessageActionTargetFromContext(context: MessageActionContext) 
   };
 }
 
+function toggleMobileMessageActions(event: Event) {
+  if (!sidebarMediaQuery.matches) return;
+  const target = event.target;
+  if (target instanceof HTMLButtonElement || target instanceof HTMLAnchorElement) return;
+
+  const row = (event.currentTarget as HTMLElement).closest?.(".pp-message-row") as HTMLElement | null;
+  if (!row) return;
+
+  const wasVisible = row.classList.contains("pp-actions-visible");
+  for (const sibling of row.parentElement?.querySelectorAll(".pp-actions-visible") ?? []) {
+    sibling.classList.remove("pp-actions-visible");
+  }
+  if (!wasVisible) {
+    row.classList.add("pp-actions-visible");
+  }
+}
+
 function handleMessageCopy(messageText: string, event: Event) {
   const button = event.currentTarget;
   if (!(button instanceof HTMLButtonElement)) {
@@ -3218,7 +3241,7 @@ function renderMessageRow(
   actions?: ReturnType<typeof html>,
 ) {
   return html`
-    <div class="pp-message-row pp-message-row-${kind}" data-message-kind=${kind}>
+    <div class="pp-message-row pp-message-row-${kind}" data-message-kind=${kind} @click=${toggleMobileMessageActions}>
       <div class="pp-message-shell pp-message-shell-${kind}">
         <div class="pp-message-surface pp-message-surface-${kind}">${content}</div>
         ${actions ?? nothing}
@@ -3699,21 +3722,10 @@ function renderMenu() {
   return html`
     <div class="pp-menu-overlay" @click=${() => { state.showMenu = false; requestRender(); }}></div>
     <div class="pp-menu" @click=${(e: Event) => e.stopPropagation()}>
-      ${state.activeSession
-        ? html`
-            <div class="pp-menu-section">Session</div>
-            <button class="pp-menu-item" @click=${openActions}>
-              \u2699\ufe0f Session actions
-            </button>
-            <div class="pp-menu-divider"></div>
-          `
-        : nothing}
-      <div class="pp-menu-section">Settings</div>
+      <div class="pp-menu-section">Display</div>
       <button class="pp-menu-item" @click=${toggleTokenUsage}>
         $ Token usage ${state.showTokenUsage ? html`<span class="check">\u2713</span>` : nothing}
       </button>
-      <div class="pp-menu-divider"></div>
-      <div class="pp-menu-section">Display</div>
       <button class="pp-menu-item" @click=${() => setDisplayMode("default")}>
         Default ${state.displayMode === "default" ? html`<span class="check">\u2713</span>` : nothing}
       </button>
@@ -3742,6 +3754,15 @@ function renderMenu() {
       <button class="pp-menu-item" @click=${() => setThemeMode("system")}>
         \ud83d\udcbb System ${state.themeMode === "system" ? html`<span class="check">\u2713</span>` : nothing}
       </button>
+      ${state.activeSession
+        ? html`
+            <div class="pp-menu-divider"></div>
+            <div class="pp-menu-section">Session</div>
+            <button class="pp-menu-item" @click=${openActions}>
+              \u2699\ufe0f Rename / tree / fork\u2026
+            </button>
+          `
+        : nothing}
     </div>
   `;
 }
@@ -4149,7 +4170,28 @@ async function apiPost<T>(path: string, body: unknown, options: ApiRequestOption
 }
 
 function getErrorMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
+  const raw = error instanceof Error ? error.message : String(error);
+  return sanitizeErrorMessage(raw);
+}
+
+function sanitizeErrorMessage(raw: string): string {
+  const trimmed = raw.trim();
+
+  // Try to extract a "message" field from JSON error bodies
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      if (typeof parsed.message === "string" && parsed.message.trim()) {
+        return sanitizeErrorMessage(parsed.message);
+      }
+    } catch {
+      // not JSON, fall through
+    }
+  }
+
+  // Strip local file system paths (e.g. /Users/…, /home/…, /node_modules/…, C:\…)
+  const cleaned = trimmed.replace(/(?:[A-Z]:\\|\/)(?:[\w.@/-]+[\\/])+[\w.@-]+/gi, "[path]");
+  return cleaned || "Something went wrong. Please try again.";
 }
 
 function isAbortError(error: unknown) {
