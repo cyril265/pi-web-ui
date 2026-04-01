@@ -2975,8 +2975,8 @@ function toggleMobileMessageActions(event: Event) {
   const target = event.target;
   if (target instanceof HTMLButtonElement || target instanceof HTMLAnchorElement) return;
 
-  const row = (event.currentTarget as HTMLElement).closest?.(".pp-message-row") as HTMLElement | null;
-  if (!row) return;
+  const row = event.currentTarget as HTMLElement;
+  if (!row?.classList) return;
 
   const wasVisible = row.classList.contains("pp-actions-visible");
   for (const sibling of row.parentElement?.querySelectorAll(".pp-actions-visible") ?? []) {
@@ -4174,15 +4174,15 @@ function getErrorMessage(error: unknown) {
   return sanitizeErrorMessage(raw);
 }
 
-function sanitizeErrorMessage(raw: string): string {
+function sanitizeErrorMessage(raw: string, depth = 0): string {
   const trimmed = raw.trim();
 
   // Try to extract a "message" field from JSON error bodies
-  if (trimmed.startsWith("{")) {
+  if (depth < 3 && trimmed.startsWith("{")) {
     try {
       const parsed = JSON.parse(trimmed) as Record<string, unknown>;
       if (typeof parsed.message === "string" && parsed.message.trim()) {
-        return sanitizeErrorMessage(parsed.message);
+        return sanitizeErrorMessage(parsed.message, depth + 1);
       }
     } catch {
       // not JSON, fall through
@@ -4190,7 +4190,7 @@ function sanitizeErrorMessage(raw: string): string {
   }
 
   // Strip local file system paths (e.g. /Users/…, /home/…, /node_modules/…, C:\…)
-  const cleaned = trimmed.replace(/(?:[A-Z]:\\|\/)(?:[\w.@/-]+[\\/])+[\w.@-]+/gi, "[path]");
+  const cleaned = trimmed.replace(/(?:[a-zA-Z]:\\|\/)(?:[\w.@/-]+[\\/])+[\w.@-]+/g, "[path]");
   return cleaned || "Something went wrong. Please try again.";
 }
 
