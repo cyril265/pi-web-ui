@@ -4190,7 +4190,7 @@ function sanitizeErrorMessage(raw: string, depth = 0): string {
   }
 
   // Strip local file system paths (e.g. /Users/…, /home/…, /node_modules/…, C:\…)
-  const cleaned = trimmed.replace(/(?:[a-zA-Z]:\\|\/)(?:[\w.@/-]+[\\/])+[\w.@-]+/g, "[path]");
+  const cleaned = trimmed.replace(/(?:[a-zA-Z]:\\|\/)[\w.@/\\-]+/g, "[path]");
   return cleaned || "Something went wrong. Please try again.";
 }
 
