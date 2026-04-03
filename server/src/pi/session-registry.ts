@@ -23,7 +23,8 @@ import { bindSessionExtensions, getRegisteredExtensionCommands } from "./extensi
 import { LiveSession } from "./live-session.js";
 import { deriveTitle, extractMessageText, serializeModel } from "./serialize.js";
 
-const INTERNAL_CHANGE_WINDOW_MS = 300;
+const INTERNAL_CHANGE_WINDOW_MS = 5_000;
+const LIVE_SESSION_DISPOSE_DELAY_MS = 30_000;
 
 const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 
@@ -53,6 +54,7 @@ export class SessionRegistry {
   private readonly modelRegistry;
   private readonly liveSessions = new Map<string, LiveSession>();
   private readonly liveSessionsByPath = new Map<string, LiveSession>();
+  private readonly scheduledSessionDisposals = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly sessionDir: string;
 
   constructor(
@@ -111,7 +113,11 @@ export class SessionRegistry {
   }
 
   getLiveSession(sessionId: string) {
-    return this.liveSessions.get(sessionId);
+    const liveSession = this.liveSessions.get(sessionId);
+    if (liveSession) {
+      this.cancelScheduledSessionDisposal(sessionId);
+    }
+    return liveSession;
   }
 
   async getAvailableModels(): Promise<ApiModelInfo[]> {
@@ -169,6 +175,7 @@ export class SessionRegistry {
 
   prompt(sessionId: string, message: string, images: ApiImageInput[]) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     void liveSession.session.prompt(message, images.length > 0 ? { images: images.map(toSdkImage) } : undefined)
       .catch((error: unknown) => {
         liveSession.publish({
@@ -181,6 +188,7 @@ export class SessionRegistry {
 
   steer(sessionId: string, message: string) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     void liveSession.session.steer(message).catch((error: unknown) => {
       liveSession.publish({
         type: "error",
@@ -192,6 +200,7 @@ export class SessionRegistry {
 
   followUp(sessionId: string, message: string) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     void liveSession.session.followUp(message).catch((error: unknown) => {
       liveSession.publish({
         type: "error",
@@ -203,12 +212,14 @@ export class SessionRegistry {
 
   async abort(sessionId: string) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     await liveSession.session.abort();
     liveSession.publishSessionPatch();
   }
 
   async cycleModel(sessionId: string) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     await liveSession.session.cycleModel();
     liveSession.publishSessionPatch();
   }
@@ -220,12 +231,14 @@ export class SessionRegistry {
       throw new Error(`Model not found: ${provider}/${modelId}`);
     }
 
+    this.prepareForSessionMutation(liveSession);
     await liveSession.session.setModel(model);
     liveSession.publishSessionPatch();
   }
 
   async compactSession(sessionId: string, instructions?: string) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     await liveSession.session.compact(instructions);
     liveSession.publishSnapshot();
     return liveSession;
@@ -233,12 +246,14 @@ export class SessionRegistry {
 
   setThinkingLevel(sessionId: string, thinkingLevel: ThinkingLevel) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     liveSession.session.setThinkingLevel(thinkingLevel);
     liveSession.publishSessionPatch();
   }
 
   renameSession(sessionId: string, name: string) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     liveSession.sessionManager.appendSessionInfo(name.trim());
     liveSession.publishSessionPatch();
     return liveSession;
@@ -257,6 +272,7 @@ export class SessionRegistry {
 
   async fork(sessionId: string, entryId: string) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     const previousSessionId = String(liveSession.session.sessionId);
     const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
     const result = await liveSession.session.fork(entryId);
@@ -273,6 +289,7 @@ export class SessionRegistry {
 
   async navigateTree(sessionId: string, entryId: string) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     const result = await liveSession.session.navigateTree(entryId);
 
     liveSession.resetAfterSessionMutation();
@@ -286,6 +303,7 @@ export class SessionRegistry {
 
   async reopenSession(sessionId: string) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     const sessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
     if (!sessionFile) {
       throw new Error("Only persisted sessions can be reloaded from disk.");
@@ -299,6 +317,7 @@ export class SessionRegistry {
 
   async reloadSession(sessionId: string) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     await this.reloadLiveSessionFromDisk(liveSession);
     liveSession.publishSnapshot();
     return liveSession;
@@ -306,17 +325,12 @@ export class SessionRegistry {
 
   respondToUiRequest(sessionId: string, response: { id: string; value: string | undefined; confirmed: boolean | undefined; cancelled: boolean | undefined; }) {
     const liveSession = this.mustGetSession(sessionId);
+    this.prepareForSessionMutation(liveSession);
     liveSession.respondToUiRequest(response);
   }
 
   disposeIfInactive(sessionId: string) {
-    const liveSession = this.liveSessions.get(sessionId);
-    if (!liveSession || !this.isInactiveLiveSession(liveSession)) {
-      return;
-    }
-
-    this.unregisterLiveSession(liveSession);
-    liveSession.dispose();
+    this.scheduleSessionDisposal(sessionId);
   }
 
   private mustGetSession(sessionId: string) {
@@ -324,6 +338,8 @@ export class SessionRegistry {
     if (!liveSession) {
       throw new Error(`Live session not found: ${sessionId}`);
     }
+
+    this.cancelScheduledSessionDisposal(sessionId);
     return liveSession;
   }
 
@@ -334,6 +350,10 @@ export class SessionRegistry {
     }
 
     return this.cwd;
+  }
+
+  private prepareForSessionMutation(liveSession: LiveSession) {
+    liveSession.expectInternalSessionWrites();
   }
 
   private async createSdkSession(cwd: string, sessionManager: PiSessionManager) {
@@ -517,6 +537,7 @@ export class SessionRegistry {
       (sessionFile) => this.reloadLiveSessionFromDisk(liveSession, sessionFile),
     );
     this.liveSessions.set(String(session.sessionId), liveSession);
+    this.cancelScheduledSessionDisposal(String(session.sessionId));
 
     if (session.sessionFile) {
       this.liveSessionsByPath.set(String(session.sessionFile), liveSession);
@@ -533,6 +554,7 @@ export class SessionRegistry {
       commandContextActions: {
         waitForIdle: () => session.agent.waitForIdle(),
         newSession: async (options: any) => {
+          liveSession.expectInternalSessionWrites();
           const previousSessionId = String(liveSession.session.sessionId);
           const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
           const success = await session.newSession(options);
@@ -543,6 +565,7 @@ export class SessionRegistry {
           return { cancelled: !success };
         },
         fork: async (entryId: string) => {
+          liveSession.expectInternalSessionWrites();
           const previousSessionId = String(liveSession.session.sessionId);
           const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
           const result = await session.fork(entryId);
@@ -551,11 +574,13 @@ export class SessionRegistry {
           return { cancelled: result.cancelled };
         },
         navigateTree: async (targetId: string, options: any) => {
+          liveSession.expectInternalSessionWrites();
           const result = await session.navigateTree(targetId, options);
           liveSession.resetAfterSessionMutation();
           return { cancelled: result.cancelled };
         },
         switchSession: async (sessionPath: string) => {
+          liveSession.expectInternalSessionWrites();
           const previousSessionId = String(liveSession.session.sessionId);
           const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
           const success = await session.switchSession(sessionPath);
@@ -566,6 +591,7 @@ export class SessionRegistry {
           return { cancelled: !success };
         },
         reload: async () => {
+          liveSession.expectInternalSessionWrites();
           await this.reloadLiveSessionFromDisk(liveSession);
           liveSession.publishSnapshot();
         },
@@ -580,6 +606,7 @@ export class SessionRegistry {
   }
 
   private unregisterLiveSession(liveSession: LiveSession) {
+    this.cancelScheduledSessionDisposal(String(liveSession.session.sessionId));
     this.liveSessions.delete(String(liveSession.session.sessionId));
     if (liveSession.session.sessionFile) {
       this.liveSessionsByPath.delete(String(liveSession.session.sessionFile));
@@ -591,12 +618,14 @@ export class SessionRegistry {
     previousSessionId: string,
     previousSessionFile: string | undefined,
   ) {
+    this.cancelScheduledSessionDisposal(previousSessionId);
     this.liveSessions.delete(previousSessionId);
     if (previousSessionFile) {
       this.liveSessionsByPath.delete(previousSessionFile);
     }
 
     this.liveSessions.set(String(liveSession.session.sessionId), liveSession);
+    this.cancelScheduledSessionDisposal(String(liveSession.session.sessionId));
     if (liveSession.session.sessionFile) {
       this.liveSessionsByPath.set(String(liveSession.session.sessionFile), liveSession);
     }
@@ -604,14 +633,49 @@ export class SessionRegistry {
 
   private pruneInactiveSessions(keepSessionIds: Iterable<string>) {
     const keep = new Set([...keepSessionIds].map(String));
-    const staleSessions = [...this.liveSessions.entries()]
-      .filter(([sessionId, liveSession]) => !keep.has(sessionId) && this.isInactiveLiveSession(liveSession))
-      .map(([, liveSession]) => liveSession);
 
-    for (const liveSession of staleSessions) {
-      this.unregisterLiveSession(liveSession);
-      liveSession.dispose();
+    for (const [sessionId, liveSession] of this.liveSessions) {
+      if (keep.has(sessionId) || !this.isInactiveLiveSession(liveSession)) {
+        this.cancelScheduledSessionDisposal(sessionId);
+        continue;
+      }
+
+      this.scheduleSessionDisposal(sessionId);
     }
+  }
+
+  private scheduleSessionDisposal(sessionId: string) {
+    const liveSession = this.liveSessions.get(sessionId);
+    if (!liveSession || !this.isInactiveLiveSession(liveSession)) {
+      this.cancelScheduledSessionDisposal(sessionId);
+      return;
+    }
+    if (this.scheduledSessionDisposals.has(sessionId)) {
+      return;
+    }
+
+    const timeoutId = setTimeout(() => {
+      this.scheduledSessionDisposals.delete(sessionId);
+      const currentLiveSession = this.liveSessions.get(sessionId);
+      if (!currentLiveSession || !this.isInactiveLiveSession(currentLiveSession)) {
+        return;
+      }
+
+      this.unregisterLiveSession(currentLiveSession);
+      currentLiveSession.dispose();
+    }, LIVE_SESSION_DISPOSE_DELAY_MS);
+
+    this.scheduledSessionDisposals.set(sessionId, timeoutId);
+  }
+
+  private cancelScheduledSessionDisposal(sessionId: string) {
+    const timeoutId = this.scheduledSessionDisposals.get(sessionId);
+    if (!timeoutId) {
+      return;
+    }
+
+    clearTimeout(timeoutId);
+    this.scheduledSessionDisposals.delete(sessionId);
   }
 
   private isInactiveLiveSession(liveSession: LiveSession) {
@@ -628,8 +692,13 @@ export class SessionRegistry {
       const changedPath = join(this.sessionDir, fileName.toString());
       const liveSession = this.liveSessionsByPath.get(changedPath);
       if (!liveSession) return;
-      if (Date.now() - liveSession.lastInternalUpdateAt <= INTERNAL_CHANGE_WINDOW_MS) return;
-      liveSession.markExternalChange();
+
+      const now = Date.now();
+      if (liveSession.isInternalChangeExpected(now) || now - liveSession.lastInternalUpdateAt <= INTERNAL_CHANGE_WINDOW_MS) {
+        return;
+      }
+
+      liveSession.markExternalChange({ reloadImmediately: liveSession.subscribers.size > 0 });
     });
   }
 }

@@ -150,6 +150,13 @@ type AppState = {
   expandedToolCards: Set<string>;
 };
 
+type BoundedTextCache = {
+  values: Map<string, string>;
+  maxEntries: number;
+  maxChars: number;
+  charCount: number;
+};
+
 /* ─── State ─── */
 
 const MOBILE_SIDEBAR_MEDIA_QUERY = "(max-width: 900px)";
@@ -159,6 +166,13 @@ const RECENT_MODELS_LIMIT = 8;
 const MAX_VISIBLE_SLASH_COMMANDS = 8;
 const FILTER_INPUT_RENDER_DELAY_MS = 100;
 const AUTO_SCROLL_NEAR_BOTTOM_THRESHOLD_PX = 64;
+const DEFAULT_VISIBLE_MESSAGE_WINDOW = 200;
+const MESSAGE_WINDOW_STEP = 200;
+const ASSISTANT_MESSAGE_PARTS_CACHE_LIMIT = 400;
+const MARKDOWN_HTML_CACHE_LIMIT = 200;
+const MARKDOWN_HTML_CACHE_CHAR_LIMIT = 2_000_000;
+const CODE_BLOCK_COPY_CACHE_LIMIT = 200;
+const CODE_BLOCK_COPY_CACHE_CHAR_LIMIT = 1_000_000;
 const sidebarMediaQuery = window.matchMedia(MOBILE_SIDEBAR_MEDIA_QUERY);
 const appRoot = document.getElementById("app");
 
@@ -240,13 +254,15 @@ let cachedMessageActionContextSource: ApiSessionSnapshot["messages"] | undefined
 let cachedMessageActionContexts = emptyMessageActionContexts;
 const EVENT_RECONNECT_BASE_DELAY_MS = 1_000;
 const EVENT_RECONNECT_MAX_DELAY_MS = 10_000;
+const EXTENSION_NOTIFICATION_DEDUPE_WINDOW_MS = 3_000;
 const THINKING_START_MARKER = "<<<pi-thinking>>>";
 const THINKING_END_MARKER = "<<<pi-thinking-end>>>";
 const assistantMessagePartsCache = new Map<string, AssistantMessagePart[]>();
-const markdownHtmlCache = new Map<string, string>();
-const codeBlockCopyCache = new Map<string, string>();
-let codeBlockCopyId = 0;
+const markdownHtmlCache = createBoundedTextCache(MARKDOWN_HTML_CACHE_LIMIT, MARKDOWN_HTML_CACHE_CHAR_LIMIT);
+const codeBlockCopyCache = createBoundedTextCache(CODE_BLOCK_COPY_CACHE_LIMIT, CODE_BLOCK_COPY_CACHE_CHAR_LIMIT);
+let visibleMessageWindow = DEFAULT_VISIBLE_MESSAGE_WINDOW;
 const sessionDirectoryOverrides = new Map<string, string>();
+const recentExtensionNotifications = new Map<string, number>();
 const requestInputRender = (() => {
   let timeoutId: number | undefined;
   return () => {
@@ -259,6 +275,82 @@ const requestInputRender = (() => {
     }, FILTER_INPUT_RENDER_DELAY_MS);
   };
 })();
+
+function createBoundedTextCache(maxEntries: number, maxChars: number): BoundedTextCache {
+  return {
+    values: new Map<string, string>(),
+    maxEntries,
+    maxChars,
+    charCount: 0,
+  };
+}
+
+function clearBoundedTextCache(cache: BoundedTextCache) {
+  cache.values.clear();
+  cache.charCount = 0;
+}
+
+function getLruCacheValue<K, V>(cache: Map<K, V>, key: K) {
+  const value = cache.get(key);
+  if (value === undefined) return undefined;
+  cache.delete(key);
+  cache.set(key, value);
+  return value;
+}
+
+function setLruCacheValue<K, V>(cache: Map<K, V>, key: K, value: V, maxEntries: number) {
+  if (cache.has(key)) {
+    cache.delete(key);
+  }
+  cache.set(key, value);
+
+  while (cache.size > maxEntries) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey === undefined) {
+      break;
+    }
+    cache.delete(oldestKey);
+  }
+}
+
+function getBoundedTextCacheValue(cache: BoundedTextCache, key: string) {
+  const value = cache.values.get(key);
+  if (value === undefined) return undefined;
+  cache.values.delete(key);
+  cache.values.set(key, value);
+  return value;
+}
+
+function setBoundedTextCacheValue(cache: BoundedTextCache, key: string, value: string) {
+  const existing = cache.values.get(key);
+  if (existing !== undefined) {
+    cache.values.delete(key);
+    cache.charCount -= existing.length;
+  }
+
+  cache.values.set(key, value);
+  cache.charCount += value.length;
+
+  while (cache.values.size > cache.maxEntries || cache.charCount > cache.maxChars) {
+    const oldestEntry = cache.values.entries().next().value;
+    if (!oldestEntry) {
+      break;
+    }
+
+    const [oldestKey, oldestValue] = oldestEntry;
+    cache.values.delete(oldestKey);
+    cache.charCount -= oldestValue.length;
+  }
+}
+
+function hashText(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
 
 const HIGHLIGHT_LANGUAGE_ALIASES: Record<string, string> = {
   bash: "bash",
@@ -620,17 +712,14 @@ function handleCreateProjectPathKeyDown(event: KeyboardEvent) {
 }
 
 async function openSession(sessionFile: string) {
-  return await loadAndOpenSnapshot(
-    async (signal) => {
-      const response = await apiPost<{ snapshot: ApiSessionSnapshot }>(
-        "/api/sessions/open",
-        { path: sessionFile },
-        { signal },
-      );
-      return response.snapshot;
-    },
-    { refreshSessions: true },
-  );
+  return await loadAndOpenSnapshot(async (signal) => {
+    const response = await apiPost<{ snapshot: ApiSessionSnapshot }>(
+      "/api/sessions/open",
+      { path: sessionFile },
+      { signal },
+    );
+    return response.snapshot;
+  });
 }
 
 async function attachToLiveSession(sessionId: string) {
@@ -641,7 +730,7 @@ async function attachToLiveSession(sessionId: string) {
 }
 
 async function sendComposer() {
-  if (!state.activeSession) return;
+  if (!state.activeSession || state.isLoading || state.switchingSessionId) return;
   if (state.isSubmittingComposer) return;
   if (!state.composerText.trim() && state.attachments.length === 0) return;
 
@@ -1021,8 +1110,8 @@ async function handleComposerPaste(event: ClipboardEvent) {
 
 function clearRenderedMessageCaches() {
   assistantMessagePartsCache.clear();
-  markdownHtmlCache.clear();
-  codeBlockCopyCache.clear();
+  clearBoundedTextCache(markdownHtmlCache);
+  clearBoundedTextCache(codeBlockCopyCache);
   clearMessageActionContextCache();
 }
 
@@ -1055,10 +1144,14 @@ function sortSessionListByLastModified(sessions: ApiSessionListItem[]) {
   return [...sessions].sort((left, right) => (right.lastModified ?? "").localeCompare(left.lastModified ?? ""));
 }
 
-function syncSessionListItem(snapshot: ApiSessionSnapshot, options: { touchLastModified?: boolean } = {}) {
-  const existing = state.sessions.find((session) =>
+function syncSessionListItem(
+  snapshot: ApiSessionSnapshot,
+  options: { touchLastModified?: boolean; preservePosition?: boolean } = {},
+) {
+  const existingIndex = state.sessions.findIndex((session) =>
     session.id === snapshot.sessionId || (snapshot.sessionFile && session.sessionFile === snapshot.sessionFile),
   );
+  const existing = existingIndex === -1 ? undefined : state.sessions[existingIndex];
   const overriddenCwd = getSessionDirectoryOverride(snapshot);
   const nextSession: ApiSessionListItem = {
     id: snapshot.sessionId,
@@ -1075,6 +1168,16 @@ function syncSessionListItem(snapshot: ApiSessionSnapshot, options: { touchLastM
     live: true,
     externallyDirty: snapshot.externallyDirty,
   };
+
+  if (options.preservePosition && existingIndex !== -1) {
+    state.sessions = [
+      ...state.sessions.slice(0, existingIndex),
+      nextSession,
+      ...state.sessions.slice(existingIndex + 1),
+    ];
+    return;
+  }
+
   const remainingSessions = state.sessions.filter((session) =>
     session.id !== snapshot.sessionId && (!snapshot.sessionFile || session.sessionFile !== snapshot.sessionFile),
   );
@@ -1193,7 +1296,7 @@ function applyToolExecutionDelta(toolExecution: ApiSessionSnapshot["toolExecutio
         toolExecution,
         ...activeSession.toolExecutions.slice(existingIndex + 1),
       ]);
-  syncSessionListItem(activeSession);
+  syncSessionListItem(activeSession, { touchLastModified: false });
   return true;
 }
 
@@ -1207,6 +1310,7 @@ function applySnapshot(snapshot: ApiSessionSnapshot, options: { resetSessionUi?:
     state.expandedToolCards = new Set<string>();
     state.availableSlashCommands = [...BUILTIN_SLASH_COMMANDS];
     state.selectedSlashCommandIndex = 0;
+    visibleMessageWindow = DEFAULT_VISIBLE_MESSAGE_WINDOW;
     clearRenderedMessageCaches();
   }
   state.renameText = snapshot.title;
@@ -1218,7 +1322,7 @@ function applySnapshot(snapshot: ApiSessionSnapshot, options: { resetSessionUi?:
   }
   state.pageTitle = snapshot.title;
   document.title = state.pageTitle;
-  syncSessionListItem(snapshot);
+  syncSessionListItem(snapshot, { touchLastModified: false, preservePosition: true });
   if (options.resetSessionUi) {
     state.error = undefined;
     state.isLoading = false;
@@ -1325,6 +1429,20 @@ function setError(message: string) {
 }
 
 function pushExtensionNotification(notification: ApiExtensionNotification) {
+  const notificationKey = `${notification.notifyType}:${notification.message}`;
+  const now = Date.now();
+  const lastShownAt = recentExtensionNotifications.get(notificationKey);
+  if (lastShownAt !== undefined && now - lastShownAt < EXTENSION_NOTIFICATION_DEDUPE_WINDOW_MS) {
+    return;
+  }
+
+  recentExtensionNotifications.set(notificationKey, now);
+  setTimeout(() => {
+    if (recentExtensionNotifications.get(notificationKey) === now) {
+      recentExtensionNotifications.delete(notificationKey);
+    }
+  }, EXTENSION_NOTIFICATION_DEDUPE_WINDOW_MS).unref?.();
+
   state.extensionNotifications = [notification, ...state.extensionNotifications].slice(0, 4);
   setTimeout(() => {
     state.extensionNotifications = state.extensionNotifications.filter((e) => e.id !== notification.id);
@@ -1911,6 +2029,36 @@ function getRenderedMessages(snapshot: ApiSessionSnapshot) {
   return pendingMessages.length > 0 ? [...snapshot.messages, ...pendingMessages] : snapshot.messages;
 }
 
+function getVisibleConversationMessages(messages: ApiSessionSnapshot["messages"]) {
+  if (messages.length <= visibleMessageWindow) {
+    return { messages, hiddenCount: 0 };
+  }
+
+  let startIndex = Math.max(0, messages.length - visibleMessageWindow);
+  for (let index = startIndex - 1; index >= 0; index -= 1) {
+    const candidate = messages[index];
+    if (!candidate) {
+      continue;
+    }
+    if (!isUserPromptMessage(candidate)) {
+      continue;
+    }
+
+    startIndex = index;
+    break;
+  }
+
+  return {
+    messages: messages.slice(startIndex),
+    hiddenCount: startIndex,
+  };
+}
+
+function showEarlierMessages() {
+  visibleMessageWindow += MESSAGE_WINDOW_STEP;
+  requestRender();
+}
+
 function clearEventReconnectTimer() {
   if (!eventReconnectTimeout) return;
   clearTimeout(eventReconnectTimeout);
@@ -2151,10 +2299,20 @@ function getCodeLanguageInfo(rawLanguage: string | undefined) {
 }
 
 function createCodeBlockCopyId(text: string) {
-  codeBlockCopyId += 1;
-  const id = `code-block-${codeBlockCopyId}`;
-  codeBlockCopyCache.set(id, text);
-  return id;
+  const baseId = `code-block-${hashText(text)}`;
+  let copyId = baseId;
+  let collisionIndex = 1;
+
+  while (true) {
+    const cachedText = getBoundedTextCacheValue(codeBlockCopyCache, copyId);
+    if (cachedText === undefined || cachedText === text) {
+      setBoundedTextCacheValue(codeBlockCopyCache, copyId, text);
+      return copyId;
+    }
+
+    copyId = `${baseId}-${collisionIndex}`;
+    collisionIndex += 1;
+  }
 }
 
 function highlightCodeBlockText(text: string, language: string | undefined) {
@@ -2619,7 +2777,7 @@ function renderToolActivityCard(options: {
 }
 
 function parseAssistantMessageParts(text: string): AssistantMessagePart[] {
-  const cached = assistantMessagePartsCache.get(text);
+  const cached = getLruCacheValue(assistantMessagePartsCache, text);
   if (cached) return cached;
 
   const normalized = text.replace(/\r\n/g, "\n");
@@ -2659,7 +2817,7 @@ function parseAssistantMessageParts(text: string): AssistantMessagePart[] {
 
   flushMarkdown();
   const resolvedParts: AssistantMessagePart[] = parts.length ? parts : [{ type: "markdown", text }];
-  assistantMessagePartsCache.set(text, resolvedParts);
+  setLruCacheValue(assistantMessagePartsCache, text, resolvedParts, ASSISTANT_MESSAGE_PARTS_CACHE_LIMIT);
   return resolvedParts;
 }
 
@@ -2875,9 +3033,9 @@ function renderToolResultSection(
 }
 
 function renderMarkdown(text: string): ReturnType<typeof html> {
-  const raw = markdownHtmlCache.get(text) ?? (() => {
+  const raw = getBoundedTextCacheValue(markdownHtmlCache, text) ?? (() => {
     const rendered = marked.parse(text, { async: false }) as string;
-    markdownHtmlCache.set(text, rendered);
+    setBoundedTextCacheValue(markdownHtmlCache, text, rendered);
     return rendered;
   })();
   return html`<div class="pp-content-block pp-markdown">${unsafeHTML(raw)}</div>`;
@@ -3067,7 +3225,7 @@ function handleAppClick(event: Event) {
   const copyId = copyButton?.dataset.copyId;
   if (!copyButton || !copyId) return;
 
-  const text = codeBlockCopyCache.get(copyId);
+  const text = getBoundedTextCacheValue(codeBlockCopyCache, copyId);
   if (text === undefined) return;
 
   event.preventDefault();
@@ -3092,7 +3250,12 @@ function getVisibleSessions() {
 
 async function handleSessionClick(session: ApiSessionListItem) {
   if (state.switchingSessionId === session.id) return;
-  if (state.activeSession?.sessionId === session.id && session.live) {
+  if (
+    state.activeSession?.sessionId === session.id
+    && session.live
+    && state.liveConnectionState !== "reconnecting"
+    && state.liveConnectionState !== "disconnected"
+  ) {
     closeSidebarIfMobile();
     return;
   }
@@ -3309,8 +3472,9 @@ function renderConversation(
 
 const template = () => {
   const renderedMessages = state.activeSession ? getRenderedMessages(state.activeSession) : [];
+  const visibleConversation = getVisibleConversationMessages(renderedMessages);
   const conversation = state.activeSession
-    ? renderConversation(renderedMessages, state.activeSession.toolExecutions)
+    ? renderConversation(visibleConversation.messages, state.activeSession.toolExecutions)
     : undefined;
   const detachedToolExecutions = conversation?.remainingToolExecutions.filter((tool) => tool.status !== "done") ?? [];
   const activeSessionListItem = getActiveSessionListItem();
@@ -3386,6 +3550,17 @@ const template = () => {
 
         <div class="pp-messages">
           <div class="pp-messages-inner">
+            ${!state.isLoading && visibleConversation.hiddenCount > 0
+              ? html`
+                  <div class="pp-conversation-window">
+                    <button class="pp-conversation-window-btn" @click=${showEarlierMessages}>
+                      Show ${Math.min(MESSAGE_WINDOW_STEP, visibleConversation.hiddenCount)} earlier message${Math.min(MESSAGE_WINDOW_STEP, visibleConversation.hiddenCount) === 1 ? "" : "s"}
+                    </button>
+                    <span class="pp-conversation-window-meta">${visibleConversation.hiddenCount} hidden</span>
+                  </div>
+                `
+              : nothing}
+
             ${state.isLoading
               ? renderSkeleton()
               : state.activeSession && renderedMessages.length
@@ -3424,61 +3599,68 @@ const template = () => {
         <div class="pp-composer-shell">
           ${renderSlashCommandPalette()}
           <div class="pp-composer">
-            <label class="pp-composer-attach" title="Attach images">
-              \ud83d\udcce
-              <input
-                type="file"
-                accept="image/*"
-                multiple
-                @change=${(e: Event) => handleFiles((e.target as HTMLInputElement).files)}
-              />
-            </label>
-            ${state.attachments.length ? renderAttachmentsRow() : nothing}
-            <textarea
-              class="pp-composer-input"
-              rows="1"
-              placeholder=${getComposerPlaceholder(state.composerMode)}
-              .value=${live(state.composerText)}
-              @input=${handleComposerInput}
-              @paste=${(e: ClipboardEvent) => {
-                void handleComposerPaste(e);
-              }}
-              @keydown=${(e: KeyboardEvent) => {
-                const selectedSlashCommand = getSelectedSlashCommand();
-                if (selectedSlashCommand && e.key === "ArrowDown") {
-                  e.preventDefault();
-                  moveSelectedSlashCommand(1);
-                  return;
-                }
-                if (selectedSlashCommand && e.key === "ArrowUp") {
-                  e.preventDefault();
-                  moveSelectedSlashCommand(-1);
-                  return;
-                }
-                if (selectedSlashCommand && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))) {
-                  e.preventDefault();
-                  applySlashCommandSelection(selectedSlashCommand);
-                  return;
-                }
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  void sendComposer();
-                }
-              }}
-            ></textarea>
-            ${state.activeSession?.status === "streaming"
-              ? html`<button
-                  class="pp-composer-btn"
-                  style="color:var(--pp-error-text);"
-                  @click=${abortRun}
-                  title="Stop"
-                >\u25a0</button>`
-              : html`<button
-                  class="pp-composer-btn"
-                  @click=${() => void sendComposer()}
-                  title="Send"
-                  ?disabled=${state.isSubmittingComposer}
-                >\u27a4</button>`}
+            ${(() => {
+              const isComposerDisabled = state.isLoading || Boolean(state.switchingSessionId) || !state.activeSession;
+              return html`
+                <label class="pp-composer-attach" title="Attach images">
+                  📎
+                  <input
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    ?disabled=${isComposerDisabled}
+                    @change=${(e: Event) => handleFiles((e.target as HTMLInputElement).files)}
+                  />
+                </label>
+                ${state.attachments.length ? renderAttachmentsRow() : nothing}
+                <textarea
+                  class="pp-composer-input"
+                  rows="1"
+                  placeholder=${getComposerPlaceholder(state.composerMode)}
+                  .value=${live(state.composerText)}
+                  ?disabled=${isComposerDisabled}
+                  @input=${handleComposerInput}
+                  @paste=${(e: ClipboardEvent) => {
+                    void handleComposerPaste(e);
+                  }}
+                  @keydown=${(e: KeyboardEvent) => {
+                    const selectedSlashCommand = getSelectedSlashCommand();
+                    if (selectedSlashCommand && e.key === "ArrowDown") {
+                      e.preventDefault();
+                      moveSelectedSlashCommand(1);
+                      return;
+                    }
+                    if (selectedSlashCommand && e.key === "ArrowUp") {
+                      e.preventDefault();
+                      moveSelectedSlashCommand(-1);
+                      return;
+                    }
+                    if (selectedSlashCommand && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))) {
+                      e.preventDefault();
+                      applySlashCommandSelection(selectedSlashCommand);
+                      return;
+                    }
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      void sendComposer();
+                    }
+                  }}
+                ></textarea>
+                ${state.activeSession?.status === "streaming"
+                  ? html`<button
+                      class="pp-composer-btn"
+                      style="color:var(--pp-error-text);"
+                      @click=${abortRun}
+                      title="Stop"
+                    >■</button>`
+                  : html`<button
+                      class="pp-composer-btn"
+                      @click=${() => void sendComposer()}
+                      title="Send"
+                      ?disabled=${isComposerDisabled || state.isSubmittingComposer}
+                    >➤</button>`}
+              `;
+            })()}
           </div>
         </div>
 

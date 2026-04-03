@@ -19,6 +19,10 @@ function normalizeExtensionWidgetContent(content: unknown): string[] | undefined
   return content.filter((line): line is string => typeof line === "string");
 }
 
+const MAX_TOOL_EXECUTION_TEXT_CHARS = 32_000;
+const TOOL_EXECUTION_TRUNCATION_MARKER = "\n\n… [tool output truncated in Pi Web]\n\n";
+const EXPECTED_INTERNAL_WRITE_WINDOW_MS = 10_000;
+
 export class LiveSession {
   readonly subscribers = new Set<SessionSubscriber>();
   readonly toolExecutions = new Map<string, ApiToolExecution>();
@@ -27,6 +31,7 @@ export class LiveSession {
   lastInternalUpdateAt = Date.now();
 
   private snapshot: ApiSessionSnapshot;
+  private internalChangeExpectedUntil = Date.now();
   private contextUsage: ApiSessionSnapshot["contextUsage"];
   private isRefreshingContextUsage = false;
   private hasPendingContextUsageRefresh = false;
@@ -63,6 +68,9 @@ export class LiveSession {
 
   subscribe(subscriber: SessionSubscriber): () => void {
     this.subscribers.add(subscriber);
+    if (this.hasPendingExternalReload && !this.externalReloadTimeout) {
+      this.scheduleExternalReload();
+    }
     subscriber({ type: "snapshot", snapshot: this.getSnapshot() });
     return () => {
       this.subscribers.delete(subscriber);
@@ -102,11 +110,23 @@ export class LiveSession {
     void this.refreshContextUsage();
   }
 
-  markExternalChange() {
+  markExternalChange(options: { reloadImmediately?: boolean } = {}) {
     this.externallyDirty = true;
     this.hasPendingExternalReload = true;
     this.publishSessionPatch(false);
-    this.scheduleExternalReload();
+    if (options.reloadImmediately ?? true) {
+      this.scheduleExternalReload();
+    }
+  }
+
+  expectInternalSessionWrites(durationMs = EXPECTED_INTERNAL_WRITE_WINDOW_MS) {
+    const now = Date.now();
+    this.lastInternalUpdateAt = now;
+    this.internalChangeExpectedUntil = Math.max(this.internalChangeExpectedUntil, now + durationMs);
+  }
+
+  isInternalChangeExpected(now = Date.now()) {
+    return now <= this.internalChangeExpectedUntil;
   }
 
   resetAfterSessionMutation() {
@@ -133,7 +153,9 @@ export class LiveSession {
 
   private markInternalUpdate(markInternalUpdate: boolean) {
     if (markInternalUpdate) {
-      this.lastInternalUpdateAt = Date.now();
+      const now = Date.now();
+      this.lastInternalUpdateAt = now;
+      this.internalChangeExpectedUntil = now;
     }
   }
 
@@ -248,6 +270,7 @@ export class LiveSession {
     if (existingIndex === -1) {
       this.snapshot.messages = [...this.snapshot.messages, serializedMessage];
       this.publishMessagesDelta(this.snapshot.messages.length - 1);
+      this.compactCompletedToolExecution(serializedMessage.toolCallId, serializedMessage.role, false);
     } else {
       const current = this.snapshot.messages[existingIndex];
       if (
@@ -268,6 +291,7 @@ export class LiveSession {
         ...this.snapshot.messages.slice(existingIndex + 1),
       ];
       this.publishMessagesDelta(existingIndex);
+      this.compactCompletedToolExecution(serializedMessage.toolCallId, serializedMessage.role, false);
     }
 
     if (fallbackIndex >= 0 || eventType === "message_end") {
@@ -285,6 +309,30 @@ export class LiveSession {
       type: "tool_execution_delta",
       toolExecution,
     });
+  }
+
+  private compactCompletedToolExecution(toolCallId: string | undefined, messageRole: string | undefined, markInternalUpdate = false) {
+    if (messageRole !== "toolResult" || !toolCallId) {
+      return;
+    }
+
+    const current = this.toolExecutions.get(toolCallId);
+    if (!current || current.status === "running" || !current.text) {
+      return;
+    }
+
+    current.text = "";
+    this.publishToolExecutionDelta(current, markInternalUpdate);
+  }
+
+  private hasToolResultMessage(toolCallId: string | undefined) {
+    if (!toolCallId) {
+      return false;
+    }
+
+    return this.snapshot.messages.some((message) =>
+      message.role === "toolResult" && message.toolCallId === toolCallId
+    );
   }
 
   respondToUiRequest(response: ApiExtensionUiResponse) {
@@ -638,6 +686,9 @@ export class LiveSession {
         if (current) {
           current.status = event.isError ? "error" : "done";
           current.text = stringifyToolOutput(event.result);
+          if (this.hasToolResultMessage(current.toolCallId)) {
+            current.text = "";
+          }
           current.updatedAt = new Date().toISOString();
           this.publishToolExecutionDelta(current);
         }
@@ -686,11 +737,25 @@ const normalizeContextUsage = (contextUsage: unknown): ApiSessionSnapshot["conte
   };
 };
 
+const truncateToolExecutionText = (value: string) => {
+  if (value.length <= MAX_TOOL_EXECUTION_TEXT_CHARS) {
+    return value;
+  }
+
+  const remainingBudget = MAX_TOOL_EXECUTION_TEXT_CHARS - TOOL_EXECUTION_TRUNCATION_MARKER.length;
+  const headLength = Math.floor(remainingBudget * 0.7);
+  const tailLength = Math.max(0, remainingBudget - headLength);
+
+  return `${value.slice(0, headLength)}${TOOL_EXECUTION_TRUNCATION_MARKER}${value.slice(-tailLength)}`;
+};
+
 const stringifyToolOutput = (value: unknown): string => {
-  if (typeof value === "string") return value;
+  if (typeof value === "string") {
+    return truncateToolExecutionText(value);
+  }
   if (value == null) return "";
 
-  return JSON.stringify(
+  const serialized = JSON.stringify(
     value,
     (key, currentValue) => {
       if (key === "data" && typeof currentValue === "string") {
@@ -699,5 +764,7 @@ const stringifyToolOutput = (value: unknown): string => {
       return currentValue;
     },
     2,
-  );
+  ) ?? "";
+
+  return truncateToolExecutionText(serialized);
 };
