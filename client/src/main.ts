@@ -18,6 +18,7 @@ import { BUILTIN_SLASH_COMMANDS } from "@pi-web-app/shared";
 import type {
   ApiExtensionNotification,
   ApiExtensionStatusEntry,
+  ApiExtensionSurface,
   ApiExtensionUiRequest,
   ApiExtensionWidget,
   ApiForkMessage,
@@ -122,6 +123,8 @@ type AppState = {
   extensionNotifications: ApiExtensionNotification[];
   extensionStatuses: ApiExtensionStatusEntry[];
   extensionWidgets: ApiExtensionWidget[];
+  extensionHeader: ApiExtensionSurface | undefined;
+  extensionFooter: ApiExtensionSurface | undefined;
   pageTitle: string | undefined;
   renameText: string;
   isLoading: boolean;
@@ -162,6 +165,7 @@ type BoundedTextCache = {
 const MOBILE_SIDEBAR_MEDIA_QUERY = "(max-width: 900px)";
 const RECENT_MODELS_STORAGE_KEY = "recent-models";
 const DISPLAY_MODE_STORAGE_KEY = "display-mode";
+const ACTIVE_SESSION_FILE_STORAGE_KEY = "active-session-file";
 const RECENT_MODELS_LIMIT = 8;
 const MAX_VISIBLE_SLASH_COMMANDS = 8;
 const FILTER_INPUT_RENDER_DELAY_MS = 100;
@@ -181,6 +185,20 @@ function loadRecentModelKeys() {
     .split("\n")
     .map((value) => value.trim())
     .filter(Boolean);
+}
+
+function getStoredActiveSessionFile() {
+  const sessionFile = localStorage.getItem(ACTIVE_SESSION_FILE_STORAGE_KEY)?.trim();
+  return sessionFile ? sessionFile : undefined;
+}
+
+function storeActiveSessionFile(sessionFile: string | undefined) {
+  if (sessionFile) {
+    localStorage.setItem(ACTIVE_SESSION_FILE_STORAGE_KEY, sessionFile);
+    return;
+  }
+
+  localStorage.removeItem(ACTIVE_SESSION_FILE_STORAGE_KEY);
 }
 
 function loadDisplayMode(): DisplayMode {
@@ -208,6 +226,8 @@ const state: AppState = {
   extensionNotifications: [],
   extensionStatuses: [],
   extensionWidgets: [],
+  extensionHeader: undefined,
+  extensionFooter: undefined,
   pageTitle: undefined,
   renameText: "",
   isLoading: true,
@@ -254,6 +274,9 @@ let cachedMessageActionContextSource: ApiSessionSnapshot["messages"] | undefined
 let cachedMessageActionContexts = emptyMessageActionContexts;
 const EVENT_RECONNECT_BASE_DELAY_MS = 1_000;
 const EVENT_RECONNECT_MAX_DELAY_MS = 10_000;
+const EXTENSION_LAYOUT_SYNC_DEBOUNCE_MS = 120;
+let extensionLayoutSyncTimeout: ReturnType<typeof setTimeout> | undefined;
+let lastReportedExtensionLayout: { sessionId: string; columns: number } | undefined;
 const EXTENSION_NOTIFICATION_DEDUPE_WINDOW_MS = 3_000;
 const THINKING_START_MARKER = "<<<pi-thinking>>>";
 const THINKING_END_MARKER = "<<<pi-thinking-end>>>";
@@ -476,7 +499,11 @@ async function bootstrap() {
   applyDisplayMode();
   try {
     await Promise.all([loadSessions(), loadModels()]);
-    const firstSession = state.sessions[0];
+    const storedSessionFile = getStoredActiveSessionFile();
+    const preferredSession = storedSessionFile
+      ? state.sessions.find((session) => session.sessionFile === storedSessionFile)
+      : undefined;
+    const firstSession = preferredSession ?? state.sessions[0];
     if (firstSession?.live) {
       try {
         await attachToLiveSession(firstSession.id);
@@ -1312,13 +1339,17 @@ function applySnapshot(snapshot: ApiSessionSnapshot, options: { resetSessionUi?:
     state.selectedSlashCommandIndex = 0;
     visibleMessageWindow = DEFAULT_VISIBLE_MESSAGE_WINDOW;
     clearRenderedMessageCaches();
+    lastReportedExtensionLayout = undefined;
   }
   state.renameText = snapshot.title;
+  storeActiveSessionFile(snapshot.sessionFile);
   if (options.resetSessionUi) {
     state.pendingExtensionUi = undefined;
     state.extensionUiValue = "";
     state.extensionStatuses = [];
     state.extensionWidgets = [];
+    state.extensionHeader = undefined;
+    state.extensionFooter = undefined;
   }
   state.pageTitle = snapshot.title;
   document.title = state.pageTitle;
@@ -1403,6 +1434,12 @@ function connectEvents(sessionId: string) {
       case "set_widget":
         setExtensionWidget(event.key, event.widget);
         break;
+      case "set_header":
+        state.extensionHeader = event.header;
+        break;
+      case "set_footer":
+        state.extensionFooter = event.footer;
+        break;
       case "set_title":
         state.pageTitle = event.title;
         document.title = event.title;
@@ -1421,6 +1458,46 @@ function connectEvents(sessionId: string) {
     requestRender();
     scheduleReconnect(sessionId);
   };
+}
+
+function scheduleExtensionLayoutSync() {
+  if (extensionLayoutSyncTimeout) {
+    clearTimeout(extensionLayoutSyncTimeout);
+  }
+
+  extensionLayoutSyncTimeout = setTimeout(() => {
+    extensionLayoutSyncTimeout = undefined;
+    void syncExtensionLayout();
+  }, EXTENSION_LAYOUT_SYNC_DEBOUNCE_MS);
+}
+
+async function syncExtensionLayout() {
+  const sessionId = state.activeSession?.sessionId;
+  if (!sessionId) {
+    lastReportedExtensionLayout = undefined;
+    return;
+  }
+
+  const main = document.querySelector<HTMLElement>(".pp-main");
+  const width = main?.clientWidth ?? 0;
+  const columns = Math.max(40, Math.min(240, Math.round(Math.max(0, width - 32) / 8)));
+  if (!Number.isFinite(columns)) {
+    return;
+  }
+
+  if (lastReportedExtensionLayout?.sessionId === sessionId && lastReportedExtensionLayout.columns === columns) {
+    return;
+  }
+
+  lastReportedExtensionLayout = { sessionId, columns };
+
+  try {
+    await apiPost(`/api/sessions/${sessionId}/layout`, { columns });
+  } catch {
+    if (lastReportedExtensionLayout?.sessionId === sessionId) {
+      lastReportedExtensionLayout = undefined;
+    }
+  }
 }
 
 function setError(message: string) {
@@ -3326,6 +3403,7 @@ function requestRender() {
     }
 
     updateFollowLatestMessages();
+    scheduleExtensionLayoutSync();
   });
 }
 
@@ -3547,6 +3625,7 @@ const template = () => {
 
         ${state.error ? html`<div class="pp-error" style="margin:0.75rem 1.5rem 0;">${state.error}</div>` : nothing}
         ${state.info ? html`<div class="pp-info" style="margin:0.75rem 1.5rem 0;">${state.info}</div>` : nothing}
+        ${renderExtensionSurface(state.extensionHeader, "header")}
 
         <div class="pp-messages">
           <div class="pp-messages-inner">
@@ -3666,38 +3745,42 @@ const template = () => {
 
         ${renderExtensionWidgets("belowEditor")}
 
-        <!-- Status bar -->
-        <div class="pp-statusbar">
-          <div class="pp-statusbar-meta">
-            ${workspaceLabel
-              ? html`<span class="pp-statusbar-detail" title=${sessionCwd}>${workspaceLabel}</span>`
-              : nothing}
-            ${contextUsageLabel && state.activeSession?.contextUsage
-              ? html`
-                  <span
-                    class="pp-statusbar-detail"
-                    title=${`${state.activeSession.contextUsage.tokens.toLocaleString()} / ${state.activeSession.contextUsage.contextWindow.toLocaleString()} tokens`}
-                  >${contextUsageLabel}</span>
-                `
-              : nothing}
-          </div>
-          <div class="pp-statusbar-actions">
-            ${state.extensionStatuses.map(
-              (s) => html`<span style="font-size:0.6875rem;">${s.key}: ${s.text}</span>`,
-            )}
-            <button class="pp-statusbar-model" @click=${openModelsDialog}>
-              ${state.activeSession?.model?.name ?? "No model"}
-            </button>
-            <button
-              class="pp-statusbar-model"
-              @click=${openThinkingLevelsDialog}
-              title="Select thinking level"
-              aria-label=${`Thinking level: ${formatThinkingLevel(state.activeSession?.thinkingLevel)}`}
-            >
-              \ud83d\udca1 ${formatThinkingLevel(state.activeSession?.thinkingLevel)}
-            </button>
-          </div>
-        </div>
+        ${state.extensionFooter
+          ? renderExtensionSurface(state.extensionFooter, "footer")
+          : html`
+              <!-- Status bar -->
+              <div class="pp-statusbar">
+                <div class="pp-statusbar-meta">
+                  ${workspaceLabel
+                    ? html`<span class="pp-statusbar-detail" title=${sessionCwd}>${workspaceLabel}</span>`
+                    : nothing}
+                  ${contextUsageLabel && state.activeSession?.contextUsage
+                    ? html`
+                        <span
+                          class="pp-statusbar-detail"
+                          title=${`${state.activeSession.contextUsage.tokens.toLocaleString()} / ${state.activeSession.contextUsage.contextWindow.toLocaleString()} tokens`}
+                        >${contextUsageLabel}</span>
+                      `
+                    : nothing}
+                </div>
+                <div class="pp-statusbar-actions">
+                  ${state.extensionStatuses.map(
+                    (s) => html`<span style="font-size:0.6875rem;">${s.key}: ${renderAnsiText(s.text, "pp-ansi-inline")}</span>`,
+                  )}
+                  <button class="pp-statusbar-model" @click=${openModelsDialog}>
+                    ${state.activeSession?.model?.name ?? "No model"}
+                  </button>
+                  <button
+                    class="pp-statusbar-model"
+                    @click=${openThinkingLevelsDialog}
+                    title="Select thinking level"
+                    aria-label=${`Thinking level: ${formatThinkingLevel(state.activeSession?.thinkingLevel)}`}
+                  >
+                    \ud83d\udca1 ${formatThinkingLevel(state.activeSession?.thinkingLevel)}
+                  </button>
+                </div>
+              </div>
+            `}
       </div>
     </div>
 
@@ -3965,7 +4048,214 @@ function renderAttachmentsRow() {
   `;
 }
 
+/* ─── ANSI rendering ─── */
+
+type AnsiStyleState = {
+  fg?: string;
+  bg?: string;
+  bold?: boolean;
+  dim?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+};
+
+function escapeAnsiHtml(text: string) {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function ansi16ColorToCss(code: number) {
+  const colors = [
+    "#000000",
+    "#cd3131",
+    "#0dbc79",
+    "#e5e510",
+    "#2472c8",
+    "#bc3fbc",
+    "#11a8cd",
+    "#e5e5e5",
+    "#666666",
+    "#f14c4c",
+    "#23d18b",
+    "#f5f543",
+    "#3b8eea",
+    "#d670d6",
+    "#29b8db",
+    "#ffffff",
+  ];
+  return colors[code];
+}
+
+function ansi256ColorToCss(code: number) {
+  if (code < 0 || code > 255) return undefined;
+  if (code < 16) return ansi16ColorToCss(code);
+  if (code >= 232) {
+    const channel = 8 + ((code - 232) * 10);
+    return `rgb(${channel}, ${channel}, ${channel})`;
+  }
+
+  const index = code - 16;
+  const red = Math.floor(index / 36);
+  const green = Math.floor((index % 36) / 6);
+  const blue = index % 6;
+  const toChannel = (value: number) => value === 0 ? 0 : (value * 40) + 55;
+  return `rgb(${toChannel(red)}, ${toChannel(green)}, ${toChannel(blue)})`;
+}
+
+function parseAnsiColor(params: number[], index: number) {
+  const mode = params[index + 1];
+  if (mode === 5) {
+    const code = params[index + 2];
+    return {
+      color: typeof code === "number" ? ansi256ColorToCss(code) : undefined,
+      nextIndex: index + 2,
+    };
+  }
+
+  if (mode === 2) {
+    const red = params[index + 2];
+    const green = params[index + 3];
+    const blue = params[index + 4];
+    const isValid = [red, green, blue].every((value) => typeof value === "number" && value >= 0 && value <= 255);
+    return {
+      color: isValid ? `rgb(${red}, ${green}, ${blue})` : undefined,
+      nextIndex: index + 4,
+    };
+  }
+
+  return {
+    color: undefined,
+    nextIndex: index,
+  };
+}
+
+function ansiStyleToCss(style: AnsiStyleState) {
+  const rules = [
+    style.fg ? `color:${style.fg}` : undefined,
+    style.bg ? `background-color:${style.bg}` : undefined,
+    style.bold ? "font-weight:600" : undefined,
+    style.dim ? "opacity:0.72" : undefined,
+    style.italic ? "font-style:italic" : undefined,
+    style.underline ? "text-decoration:underline" : undefined,
+  ].filter((value): value is string => Boolean(value));
+
+  return rules.join(";");
+}
+
+function renderAnsiHtml(text: string) {
+  const pattern = /\x1b\[([0-9;]*)m/g;
+  const style: AnsiStyleState = {};
+  let cursor = 0;
+  let result = "";
+
+  const appendChunk = (chunk: string) => {
+    if (!chunk) return;
+    const escaped = escapeAnsiHtml(chunk);
+    const css = ansiStyleToCss(style);
+    result += css ? `<span style="${css}">${escaped}</span>` : escaped;
+  };
+
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    appendChunk(text.slice(cursor, index));
+    cursor = index + match[0].length;
+
+    const params = match[1]
+      ? match[1].split(";").map((value) => Number.parseInt(value, 10)).filter((value) => Number.isFinite(value))
+      : [0];
+
+    for (let paramIndex = 0; paramIndex < params.length; paramIndex += 1) {
+      const code = params[paramIndex] ?? 0;
+      switch (code) {
+        case 0:
+          delete style.fg;
+          delete style.bg;
+          delete style.bold;
+          delete style.dim;
+          delete style.italic;
+          delete style.underline;
+          break;
+        case 1:
+          style.bold = true;
+          break;
+        case 2:
+          style.dim = true;
+          break;
+        case 3:
+          style.italic = true;
+          break;
+        case 4:
+          style.underline = true;
+          break;
+        case 22:
+          delete style.bold;
+          delete style.dim;
+          break;
+        case 23:
+          delete style.italic;
+          break;
+        case 24:
+          delete style.underline;
+          break;
+        case 39:
+          delete style.fg;
+          break;
+        case 49:
+          delete style.bg;
+          break;
+        default:
+          if (code >= 30 && code <= 37) {
+            style.fg = ansi16ColorToCss(code - 30);
+            break;
+          }
+          if (code >= 90 && code <= 97) {
+            style.fg = ansi16ColorToCss((code - 90) + 8);
+            break;
+          }
+          if (code >= 40 && code <= 47) {
+            style.bg = ansi16ColorToCss(code - 40);
+            break;
+          }
+          if (code >= 100 && code <= 107) {
+            style.bg = ansi16ColorToCss((code - 100) + 8);
+            break;
+          }
+          if (code === 38 || code === 48) {
+            const { color, nextIndex } = parseAnsiColor(params, paramIndex);
+            if (code === 38) {
+              style.fg = color;
+            } else {
+              style.bg = color;
+            }
+            paramIndex = nextIndex;
+          }
+          break;
+      }
+    }
+  }
+
+  appendChunk(text.slice(cursor));
+  return result;
+}
+
+function renderAnsiText(text: string, className = "") {
+  return html`<span class=${className}>${unsafeHTML(renderAnsiHtml(text))}</span>`;
+}
+
 /* ─── Extension widgets ─── */
+
+function renderExtensionSurface(surface: ApiExtensionSurface | undefined, kind: "header" | "footer") {
+  if (!surface || surface.lines.length === 0) return nothing;
+  return html`
+    <div class="pp-extension-surface pp-extension-surface-${kind}">
+      <pre>${unsafeHTML(renderAnsiHtml(surface.lines.join("\n")))}</pre>
+    </div>
+  `;
+}
 
 function renderExtensionWidgets(placement: "aboveEditor" | "belowEditor") {
   const widgets = state.extensionWidgets.filter((w) => w.placement === placement);
@@ -3976,7 +4266,7 @@ function renderExtensionWidgets(placement: "aboveEditor" | "belowEditor") {
         (w) => html`
           <div style="margin-bottom:0.5rem;padding:0.5rem 0.75rem;border:1px solid var(--pp-border);border-radius:0.375rem;background:var(--pp-bg-secondary);">
             <div style="font-size:0.625rem;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;color:var(--pp-text-muted);margin-bottom:0.25rem;">${w.key}</div>
-            <pre style="font-size:0.75rem;line-height:1.5;color:var(--pp-text-muted);white-space:pre-wrap;word-break:break-word;margin:0;">${w.lines.join("\n")}</pre>
+            <pre style="font-size:0.75rem;line-height:1.5;color:var(--pp-text-muted);white-space:pre-wrap;word-break:break-word;margin:0;">${unsafeHTML(renderAnsiHtml(w.lines.join("\n")))}</pre>
           </div>
         `,
       )}
@@ -4347,6 +4637,8 @@ if (typeof sidebarMediaQuery.addEventListener === "function") {
 } else {
   sidebarMediaQuery.addListener(handleSidebarViewportChange);
 }
+
+window.addEventListener("resize", scheduleExtensionLayoutSync, { passive: true });
 
 setupAppInteractions();
 await bootstrap();

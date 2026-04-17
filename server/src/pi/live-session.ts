@@ -1,16 +1,34 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type {
   ApiExtensionNotification,
+  ApiExtensionSurface,
   ApiExtensionUiRequest,
   ApiExtensionUiResponse,
+  ApiExtensionWidget,
   ApiSessionPatch,
   ApiSessionSnapshot,
   ApiToolExecution,
   SessionEvent,
 } from "@pi-web-app/shared";
+import { GlobalMutationTracker } from "./global-mutation-tracker.js";
 import { createSnapshot, createSnapshotMetadata, serializeMessage } from "./serialize.js";
 
 export type SessionSubscriber = (event: SessionEvent) => void;
+
+type ExtensionRenderableComponent = {
+  render: (width: number) => unknown;
+  invalidate?: () => void;
+  dispose?: () => void;
+};
+
+type ExtensionRenderableWidget = {
+  key: string;
+  placement: ApiExtensionWidget["placement"];
+  lines?: string[];
+  component?: ExtensionRenderableComponent;
+  renderedLines?: string[];
+};
 
 function normalizeExtensionWidgetContent(content: unknown): string[] | undefined {
   if (content == null) return undefined;
@@ -19,9 +37,33 @@ function normalizeExtensionWidgetContent(content: unknown): string[] | undefined
   return content.filter((line): line is string => typeof line === "string");
 }
 
+function normalizeRenderedLines(content: unknown): string[] {
+  if (typeof content === "string") return [content];
+  if (!Array.isArray(content)) return [];
+  return content.filter((line): line is string => typeof line === "string");
+}
+
+function isRenderableComponent(value: unknown): value is ExtensionRenderableComponent {
+  return typeof value === "object" && value !== null && typeof (value as { render?: unknown }).render === "function";
+}
+
+function linesEqual(left: readonly string[] | undefined, right: readonly string[] | undefined) {
+  if (left === right) return true;
+  if (!left || !right || left.length !== right.length) return false;
+  return left.every((line, index) => line === right[index]);
+}
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 const MAX_TOOL_EXECUTION_TEXT_CHARS = 32_000;
 const TOOL_EXECUTION_TRUNCATION_MARKER = "\n\n… [tool output truncated in Pi Web]\n\n";
 const EXPECTED_INTERNAL_WRITE_WINDOW_MS = 10_000;
+const DEFAULT_EXTENSION_RENDER_COLUMNS = 100;
+const MIN_EXTENSION_RENDER_COLUMNS = 40;
+const MAX_EXTENSION_RENDER_COLUMNS = 240;
+const GIT_BRANCH_POLL_INTERVAL_MS = 3_000;
 
 export class LiveSession {
   readonly subscribers = new Set<SessionSubscriber>();
@@ -47,20 +89,34 @@ export class LiveSession {
       timeoutId: ReturnType<typeof setTimeout> | undefined;
     }
   >();
+  private readonly extensionStatuses = new Map<string, string>();
+  private readonly extensionWidgets = new Map<string, ExtensionRenderableWidget>();
+  private readonly extensionBranchChangeListeners = new Set<() => void>();
+  private extensionHeader: { component: ExtensionRenderableComponent; renderedLines?: string[] } | undefined;
+  private extensionFooter: { component: ExtensionRenderableComponent; renderedLines?: string[] } | undefined;
+  private extensionTitle: string | undefined;
+  private extensionBranchPollInterval: ReturnType<typeof setInterval> | undefined;
+  private cachedGitBranch: string | null | undefined;
+  private availableProviderCount = 1;
+  private renderColumns = DEFAULT_EXTENSION_RENDER_COLUMNS;
+  private globalMutationTracker: GlobalMutationTracker | undefined;
   private unsubscribeFromSession: () => void;
 
   constructor(
     session: any,
     sessionManager: any,
     private readonly reloadPersistedSession: (sessionFile: string) => Promise<void>,
+    globalMutationTracker?: GlobalMutationTracker,
   ) {
     this.session = session;
     this.sessionManager = sessionManager;
     this.contextUsage = undefined;
+    this.globalMutationTracker = globalMutationTracker;
     this.unsubscribeFromSession = () => {};
     this.subscribeToSession(session);
     this.snapshot = this.createCurrentSnapshot();
     void this.refreshContextUsage();
+    void this.refreshAvailableProviderCount();
   }
 
   session: any;
@@ -72,6 +128,7 @@ export class LiveSession {
       this.scheduleExternalReload();
     }
     subscriber({ type: "snapshot", snapshot: this.getSnapshot() });
+    this.replayExtensionUiState(subscriber);
     return () => {
       this.subscribers.delete(subscriber);
     };
@@ -88,6 +145,32 @@ export class LiveSession {
     return typeof sessionName === "string" && sessionName.trim() ? sessionName : undefined;
   }
 
+  setLayoutColumns(columns: number) {
+    const normalizedColumns = Math.max(
+      MIN_EXTENSION_RENDER_COLUMNS,
+      Math.min(MAX_EXTENSION_RENDER_COLUMNS, Math.round(columns || DEFAULT_EXTENSION_RENDER_COLUMNS)),
+    );
+
+    if (this.renderColumns === normalizedColumns) {
+      return;
+    }
+
+    this.renderColumns = normalizedColumns;
+    this.renderDynamicExtensionUi();
+  }
+
+  setGlobalMutationTracker(globalMutationTracker: GlobalMutationTracker | undefined) {
+    this.globalMutationTracker = globalMutationTracker;
+  }
+
+  releaseGlobalMutations() {
+    this.globalMutationTracker?.release();
+  }
+
+  restoreGlobalMutations() {
+    this.globalMutationTracker?.reapply();
+  }
+
   publishSnapshot(markInternalUpdate = true) {
     this.markInternalUpdate(markInternalUpdate);
     this.snapshot = this.createCurrentSnapshot();
@@ -95,7 +178,9 @@ export class LiveSession {
       type: "snapshot",
       snapshot: this.snapshot,
     });
+    this.renderDynamicExtensionUi();
     void this.refreshContextUsage();
+    void this.refreshAvailableProviderCount();
   }
 
   publishSessionPatch(markInternalUpdate = true) {
@@ -107,7 +192,9 @@ export class LiveSession {
         patch,
       });
     }
+    this.renderDynamicExtensionUi();
     void this.refreshContextUsage();
+    void this.refreshAvailableProviderCount();
   }
 
   markExternalChange(options: { reloadImmediately?: boolean } = {}) {
@@ -138,6 +225,32 @@ export class LiveSession {
   publish(event: SessionEvent) {
     for (const subscriber of this.subscribers) {
       subscriber(event);
+    }
+  }
+
+  private replayExtensionUiState(subscriber: SessionSubscriber) {
+    if (this.extensionTitle) {
+      subscriber({ type: "set_title", title: this.extensionTitle });
+    }
+    if (this.extensionHeader) {
+      subscriber({ type: "set_header", header: { lines: this.extensionHeader.renderedLines ?? [] } });
+    }
+    if (this.extensionFooter) {
+      subscriber({ type: "set_footer", footer: { lines: this.extensionFooter.renderedLines ?? [] } });
+    }
+    for (const [key, text] of this.extensionStatuses) {
+      subscriber({ type: "set_status", key, text });
+    }
+    for (const widget of this.extensionWidgets.values()) {
+      subscriber({
+        type: "set_widget",
+        key: widget.key,
+        widget: {
+          key: widget.key,
+          placement: widget.placement,
+          lines: widget.component ? (widget.renderedLines ?? []) : (widget.lines ?? []),
+        },
+      });
     }
   }
 
@@ -348,12 +461,245 @@ export class LiveSession {
     pendingRequest.resolve(response);
   }
 
-  createExtensionUiContext() {
-    const theme = {
+  private getSessionCwd() {
+    const cwd = this.session?.sessionManager?.getCwd?.() ?? this.sessionManager?.getCwd?.();
+    return typeof cwd === "string" && cwd.trim() ? cwd : undefined;
+  }
+
+  private resolveGitBranch() {
+    const cwd = this.getSessionCwd();
+    if (!cwd) {
+      return null;
+    }
+
+    try {
+      const branch = execFileSync("git", ["--no-optional-locks", "symbolic-ref", "--quiet", "--short", "HEAD"], {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      return branch || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private getGitBranch() {
+    const branch = this.resolveGitBranch();
+    this.cachedGitBranch = branch;
+    return branch;
+  }
+
+  private ensureBranchPolling() {
+    if (this.extensionBranchPollInterval || this.extensionBranchChangeListeners.size === 0) {
+      return;
+    }
+
+    this.cachedGitBranch = this.resolveGitBranch();
+    this.extensionBranchPollInterval = setInterval(() => {
+      const nextBranch = this.resolveGitBranch();
+      if (nextBranch === this.cachedGitBranch) {
+        return;
+      }
+
+      this.cachedGitBranch = nextBranch;
+      for (const listener of this.extensionBranchChangeListeners) {
+        listener();
+      }
+    }, GIT_BRANCH_POLL_INTERVAL_MS);
+    this.extensionBranchPollInterval.unref?.();
+  }
+
+  private stopBranchPollingIfIdle() {
+    if (this.extensionBranchChangeListeners.size > 0 || !this.extensionBranchPollInterval) {
+      return;
+    }
+
+    clearInterval(this.extensionBranchPollInterval);
+    this.extensionBranchPollInterval = undefined;
+  }
+
+  private onExtensionBranchChange(listener: () => void) {
+    this.extensionBranchChangeListeners.add(listener);
+    this.ensureBranchPolling();
+    return () => {
+      this.extensionBranchChangeListeners.delete(listener);
+      this.stopBranchPollingIfIdle();
+    };
+  }
+
+  private async refreshAvailableProviderCount() {
+    const getAvailable = this.session?.modelRegistry?.getAvailable;
+    if (typeof getAvailable !== "function") {
+      return;
+    }
+
+    try {
+      const models = await getAvailable.call(this.session.modelRegistry);
+      if (!Array.isArray(models)) {
+        return;
+      }
+
+      const nextCount = new Set(
+        models
+          .map((model: any) => typeof model?.provider === "string" ? model.provider : undefined)
+          .filter((provider): provider is string => Boolean(provider)),
+      ).size;
+
+      if (!nextCount || nextCount === this.availableProviderCount) {
+        return;
+      }
+
+      this.availableProviderCount = nextCount;
+      this.renderDynamicExtensionUi();
+    } catch {
+      // Ignore model registry refresh failures in web-ui bridge.
+    }
+  }
+
+  private renderExtensionComponent(component: ExtensionRenderableComponent, label: string) {
+    try {
+      return normalizeRenderedLines(component.render(this.renderColumns));
+    } catch (error) {
+      return [`${label} error: ${getErrorMessage(error)}`];
+    }
+  }
+
+  private disposeExtensionWidget(key: string) {
+    const existing = this.extensionWidgets.get(key);
+    existing?.component?.dispose?.();
+  }
+
+  private setRenderedHeader(surface: ApiExtensionSurface | undefined) {
+    this.publish({ type: "set_header", header: surface });
+  }
+
+  private setRenderedFooter(surface: ApiExtensionSurface | undefined) {
+    this.publish({ type: "set_footer", footer: surface });
+  }
+
+  private renderExtensionHeader(forcePublish = false) {
+    if (!this.extensionHeader) {
+      if (forcePublish) {
+        this.setRenderedHeader(undefined);
+      }
+      return;
+    }
+
+    const lines = this.renderExtensionComponent(this.extensionHeader.component, "header");
+    if (!forcePublish && linesEqual(this.extensionHeader.renderedLines, lines)) {
+      return;
+    }
+
+    this.extensionHeader.renderedLines = lines;
+    this.setRenderedHeader({ lines });
+  }
+
+  private renderExtensionFooter(forcePublish = false) {
+    if (!this.extensionFooter) {
+      if (forcePublish) {
+        this.setRenderedFooter(undefined);
+      }
+      return;
+    }
+
+    const lines = this.renderExtensionComponent(this.extensionFooter.component, "footer");
+    if (!forcePublish && linesEqual(this.extensionFooter.renderedLines, lines)) {
+      return;
+    }
+
+    this.extensionFooter.renderedLines = lines;
+    this.setRenderedFooter({ lines });
+  }
+
+  private renderExtensionWidget(key: string, forcePublish = false) {
+    const widget = this.extensionWidgets.get(key);
+    if (!widget) {
+      if (forcePublish) {
+        this.publish({ type: "set_widget", key, widget: undefined });
+      }
+      return;
+    }
+
+    if (!widget.component) {
+      if (forcePublish || widget.lines !== undefined) {
+        this.publish({
+          type: "set_widget",
+          key,
+          widget: {
+            key,
+            placement: widget.placement,
+            lines: widget.lines ?? [],
+          },
+        });
+      }
+      return;
+    }
+
+    const lines = this.renderExtensionComponent(widget.component, `widget:${key}`);
+    if (!forcePublish && linesEqual(widget.renderedLines, lines)) {
+      return;
+    }
+
+    widget.renderedLines = lines;
+    this.publish({
+      type: "set_widget",
+      key,
+      widget: {
+        key,
+        placement: widget.placement,
+        lines,
+      },
+    });
+  }
+
+  private renderDynamicExtensionUi() {
+    this.renderExtensionHeader();
+    this.renderExtensionFooter();
+    for (const widget of this.extensionWidgets.values()) {
+      if (widget.component) {
+        this.renderExtensionWidget(widget.key);
+      }
+    }
+  }
+
+  createExtensionUiContext(options: { suppressNotifications?: boolean } = {}) {
+    const passthroughThemeStyle = (...args: unknown[]) => {
+      for (let index = args.length - 1; index >= 0; index -= 1) {
+        const value = args[index];
+        if (typeof value === "string") {
+          return value;
+        }
+      }
+      return "";
+    };
+
+    const theme = new Proxy({
       name: "web-ui",
       mode: "dark",
       fg: (_color: string, text: string) => text,
       bg: (_color: string, text: string) => text,
+    }, {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver);
+        if (value !== undefined || typeof property === "symbol") {
+          return value;
+        }
+        return passthroughThemeStyle;
+      },
+    });
+
+    const extensionTui = {
+      requestRender: () => {
+        this.renderDynamicExtensionUi();
+      },
+    };
+
+    const footerData = {
+      getGitBranch: () => this.getGitBranch(),
+      getExtensionStatuses: () => this.extensionStatuses,
+      getAvailableProviderCount: () => this.availableProviderCount,
+      onBranchChange: (listener: () => void) => this.onExtensionBranchChange(listener),
     };
 
     return {
@@ -406,6 +752,10 @@ export class LiveSession {
           (response) => response.cancelled ? undefined : response.value,
         ),
       notify: (message: string, notifyType?: "info" | "warning" | "error") => {
+        if (options.suppressNotifications) {
+          return;
+        }
+
         const notification: ApiExtensionNotification = {
           id: randomUUID(),
           message,
@@ -419,30 +769,116 @@ export class LiveSession {
       },
       onTerminalInput: () => () => {},
       setStatus: (key: string, text?: string) => {
+        if (text === undefined) {
+          this.extensionStatuses.delete(key);
+        } else {
+          this.extensionStatuses.set(key, text);
+        }
+
         this.publish({
           type: "set_status",
           key,
           text,
         });
+        this.renderExtensionFooter();
       },
       setWorkingMessage: () => {},
-      setWidget: (key: string, content?: string | readonly string[], options?: { placement?: "aboveEditor" | "belowEditor" }) => {
+      setWidget: (
+        key: string,
+        content?: string | readonly string[] | ((tui: unknown, thm: unknown) => unknown),
+        options?: { placement?: "aboveEditor" | "belowEditor" },
+      ) => {
+        const placement = options?.placement ?? "aboveEditor";
+        this.disposeExtensionWidget(key);
+
+        if (typeof content === "function") {
+          try {
+            const instance = content(extensionTui, theme);
+            if (!isRenderableComponent(instance)) {
+              this.extensionWidgets.delete(key);
+              this.publish({ type: "set_widget", key, widget: undefined });
+              return;
+            }
+
+            this.extensionWidgets.set(key, {
+              key,
+              placement,
+              component: instance,
+            });
+            this.renderExtensionWidget(key, true);
+          } catch (error) {
+            this.extensionWidgets.set(key, {
+              key,
+              placement,
+              lines: [`widget:${key} error: ${getErrorMessage(error)}`],
+            });
+            this.renderExtensionWidget(key, true);
+          }
+          return;
+        }
+
         const normalizedContent = normalizeExtensionWidgetContent(content);
-        this.publish({
-          type: "set_widget",
+        if (!normalizedContent) {
+          this.extensionWidgets.delete(key);
+          this.publish({ type: "set_widget", key, widget: undefined });
+          return;
+        }
+
+        this.extensionWidgets.set(key, {
           key,
-          widget: normalizedContent
-            ? {
-                key,
-                lines: normalizedContent,
-                placement: options?.placement ?? "aboveEditor",
-              }
-            : undefined,
+          placement,
+          lines: normalizedContent,
         });
+        this.renderExtensionWidget(key, true);
       },
-      setFooter: () => {},
-      setHeader: () => {},
+      setFooter: (
+        factory?: (tui: unknown, thm: unknown, footerDataProvider: typeof footerData) => unknown,
+      ) => {
+        this.extensionFooter?.component.dispose?.();
+        this.extensionFooter = undefined;
+
+        if (!factory) {
+          this.setRenderedFooter(undefined);
+          return;
+        }
+
+        try {
+          const instance = factory(extensionTui, theme, footerData);
+          if (!isRenderableComponent(instance)) {
+            this.setRenderedFooter({ lines: ["footer error: factory returned invalid component"] });
+            return;
+          }
+
+          this.extensionFooter = { component: instance };
+          this.renderExtensionFooter(true);
+        } catch (error) {
+          this.setRenderedFooter({ lines: [`footer error: ${getErrorMessage(error)}`] });
+        }
+      },
+      setHeader: (factory?: (tui: unknown, thm: unknown) => unknown) => {
+        this.extensionHeader?.component.dispose?.();
+        this.extensionHeader = undefined;
+
+        if (!factory) {
+          this.setRenderedHeader(undefined);
+          return;
+        }
+
+        try {
+          const instance = factory(extensionTui, theme);
+          if (!isRenderableComponent(instance)) {
+            this.setRenderedHeader({ lines: ["header error: factory returned invalid component"] });
+            return;
+          }
+
+          this.extensionHeader = { component: instance };
+          this.renderExtensionHeader(true);
+        } catch (error) {
+          this.setRenderedHeader({ lines: [`header error: ${getErrorMessage(error)}`] });
+        }
+      },
       setTitle: (title: string) => {
+        this.extensionTitle = title;
         this.publish({
           type: "set_title",
           title,
@@ -468,26 +904,42 @@ export class LiveSession {
     };
   }
 
-  replaceSession(session: any, sessionManager: any) {
+  replaceSession(session: any, sessionManager: any, globalMutationTracker?: GlobalMutationTracker) {
     const previousSession = this.session;
+    this.globalMutationTracker?.release();
     this.unsubscribeFromSession();
     this.cancelPendingUiRequests();
 
     this.session = session;
     this.sessionManager = sessionManager;
+    this.globalMutationTracker = globalMutationTracker;
     this.pendingMessageIds.clear();
     this.pendingMessageSequence = 0;
     this.toolExecutions.clear();
     this.contextUsage = undefined;
+    this.cachedGitBranch = undefined;
 
     this.subscribeToSession(session);
+    this.renderDynamicExtensionUi();
+    void this.refreshAvailableProviderCount();
     previousSession.dispose();
   }
 
   dispose() {
+    this.globalMutationTracker?.release();
+    this.globalMutationTracker = undefined;
     if (this.externalReloadTimeout) {
       clearTimeout(this.externalReloadTimeout);
       this.externalReloadTimeout = undefined;
+    }
+    if (this.extensionBranchPollInterval) {
+      clearInterval(this.extensionBranchPollInterval);
+      this.extensionBranchPollInterval = undefined;
+    }
+    this.extensionHeader?.component.dispose?.();
+    this.extensionFooter?.component.dispose?.();
+    for (const widget of this.extensionWidgets.values()) {
+      widget.component?.dispose?.();
     }
     this.cancelPendingUiRequests();
     this.subscribers.clear();

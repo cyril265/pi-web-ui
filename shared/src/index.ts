@@ -180,6 +180,10 @@ export interface ApiExtensionWidget {
   placement: "aboveEditor" | "belowEditor";
 }
 
+export interface ApiExtensionSurface {
+  lines: string[];
+}
+
 export type SessionEvent =
   | {
       type: "snapshot";
@@ -227,6 +231,14 @@ export type SessionEvent =
       type: "set_widget";
       widget: ApiExtensionWidget | undefined;
       key: string;
+    }
+  | {
+      type: "set_header";
+      header: ApiExtensionSurface | undefined;
+    }
+  | {
+      type: "set_footer";
+      footer: ApiExtensionSurface | undefined;
     }
   | {
       type: "set_title";

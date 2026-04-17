@@ -617,6 +617,37 @@ button:not(:disabled) {
   min-width: 0;
 }
 
+.pp-extension-surface {
+  flex-shrink: 0;
+  padding: 0.75rem 1rem;
+  background: var(--pp-bg-secondary);
+}
+
+.pp-extension-surface-header {
+  border-bottom: 1px solid var(--pp-border);
+}
+
+.pp-extension-surface-footer {
+  border-top: 1px solid var(--pp-border);
+  background: var(--pp-composer-bg);
+}
+
+.pp-extension-surface pre {
+  width: min(100%, var(--pp-conversation-max-width));
+  margin: 0 auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--pp-text-muted);
+}
+
+.pp-ansi-inline {
+  white-space: pre-wrap;
+}
+
 .pp-conversation-window {
   display: flex;
   align-items: center;

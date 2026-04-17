@@ -210,6 +210,16 @@ app.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId", async (re
   }
 });
 
+app.post<{ Params: { sessionId: string }; Body: { columns: number } }>("/api/sessions/:sessionId/layout", async (request, reply) => {
+  const liveSession = sessionRegistry.getLiveSession(request.params.sessionId);
+  if (!liveSession) {
+    return reply.code(404).send({ message: "Session not found" });
+  }
+
+  liveSession.setLayoutColumns(request.body?.columns);
+  return { ok: true };
+});
+
 app.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId/commands", async (request) => ({
   commands: await sessionRegistry.getSlashCommands(request.params.sessionId),
 }));

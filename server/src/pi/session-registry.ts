@@ -20,6 +20,7 @@ import type {
   ThinkingLevel,
 } from "@pi-web-app/shared";
 import { bindSessionExtensions, getRegisteredExtensionCommands } from "./extension-bridge.js";
+import { GlobalMutationTracker } from "./global-mutation-tracker.js";
 import { LiveSession } from "./live-session.js";
 import { deriveTitle, extractMessageText, serializeModel } from "./serialize.js";
 
@@ -55,6 +56,7 @@ export class SessionRegistry {
   private readonly liveSessions = new Map<string, LiveSession>();
   private readonly liveSessionsByPath = new Map<string, LiveSession>();
   private readonly scheduledSessionDisposals = new Map<string, ReturnType<typeof setTimeout>>();
+  private activeGlobalSessionId: string | undefined;
   private readonly sessionDir: string;
 
   constructor(
@@ -95,9 +97,12 @@ export class SessionRegistry {
     }
 
     const sessionManager = SessionManager.create(resolvedCwd, this.sessionDir);
-    const session = await this.createSdkSession(resolvedCwd, sessionManager);
+    const { session, globalMutationTracker } = await this.createSdkSession(resolvedCwd, sessionManager);
 
-    const liveSession = await this.registerSession(session, sessionManager);
+    const liveSession = await this.registerSession(session, sessionManager, globalMutationTracker, {
+      suppressNotifications: false,
+    });
+    this.activateLiveSessionGlobals(liveSession);
     this.pruneInactiveSessions([String(liveSession.session.sessionId)]);
     return liveSession;
   }
@@ -108,6 +113,7 @@ export class SessionRegistry {
 
   activateSession(sessionId: string) {
     const liveSession = this.mustGetSession(sessionId);
+    this.activateLiveSessionGlobals(liveSession);
     this.pruneInactiveSessions([String(liveSession.session.sessionId)]);
     return liveSession;
   }
@@ -116,6 +122,7 @@ export class SessionRegistry {
     const liveSession = this.liveSessions.get(sessionId);
     if (liveSession) {
       this.cancelScheduledSessionDisposal(sessionId);
+      this.activateLiveSessionGlobals(liveSession);
     }
     return liveSession;
   }
@@ -357,28 +364,39 @@ export class SessionRegistry {
   }
 
   private async createSdkSession(cwd: string, sessionManager: PiSessionManager) {
-    const { session } = await createAgentSession({
-      cwd,
-      agentDir: this.agentDir,
-      authStorage: this.authStorage,
-      modelRegistry: this.modelRegistry,
-      sessionManager,
-    });
+    const { result, tracker } = await GlobalMutationTracker.capture(() =>
+      createAgentSession({
+        cwd,
+        agentDir: this.agentDir,
+        authStorage: this.authStorage,
+        modelRegistry: this.modelRegistry,
+        sessionManager,
+      })
+    );
 
-    return session;
+    return {
+      session: result.session,
+      globalMutationTracker: tracker,
+    };
   }
 
   private async createOpenedSession(sessionFile: string, liveSession: LiveSession | undefined = undefined) {
     const sessionManager = SessionManager.open(sessionFile);
     const sessionHeader = sessionManager.getHeader?.();
     const sessionCwd = typeof sessionHeader?.cwd === "string" ? resolve(sessionHeader.cwd) : this.cwd;
-    const session = await this.createSdkSession(sessionCwd, sessionManager);
+    const { session, globalMutationTracker } = await this.createSdkSession(sessionCwd, sessionManager);
+    const suppressNotifications = sessionManager.getEntries().length > 0;
 
-    if (liveSession) {
-      await this.bindSessionToLiveSession(session, liveSession);
+    if (!liveSession) {
+      return { session, sessionManager, globalMutationTracker, suppressNotifications };
     }
 
-    return { session, sessionManager };
+    const bindTracker = await this.bindSessionToLiveSession(session, liveSession, { suppressNotifications });
+    return {
+      session,
+      sessionManager,
+      globalMutationTracker: globalMutationTracker.merge(bindTracker),
+    };
   }
 
   private async reloadLiveSessionFromDisk(liveSession: LiveSession, sessionFileOverride?: string) {
@@ -389,14 +407,23 @@ export class SessionRegistry {
 
     const previousSessionId = String(liveSession.session.sessionId);
     const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
-    const { session, sessionManager } = await this.createOpenedSession(sessionFile, liveSession);
-    liveSession.replaceSession(session, sessionManager);
-    this.syncLiveSessionIdentity(liveSession, previousSessionId, previousSessionFile);
+
+    liveSession.releaseGlobalMutations();
+
+    try {
+      const { session, sessionManager, globalMutationTracker } = await this.createOpenedSession(sessionFile, liveSession);
+      liveSession.replaceSession(session, sessionManager, globalMutationTracker);
+      this.syncLiveSessionIdentity(liveSession, previousSessionId, previousSessionFile);
+    } catch (error) {
+      liveSession.restoreGlobalMutations();
+      throw error;
+    }
   }
 
   private async openSessionInternal(sessionFile: string, forceReload: boolean) {
     const existing = this.liveSessionsByPath.get(sessionFile);
     if (existing && !forceReload) {
+      this.activateLiveSessionGlobals(existing);
       this.pruneInactiveSessions([String(existing.session.sessionId)]);
       return existing;
     }
@@ -406,9 +433,12 @@ export class SessionRegistry {
       existing.dispose();
     }
 
-    const { session, sessionManager } = await this.createOpenedSession(sessionFile);
+    const { session, sessionManager, globalMutationTracker, suppressNotifications = false } = await this.createOpenedSession(sessionFile);
 
-    const liveSession = await this.registerSession(session, sessionManager);
+    const liveSession = await this.registerSession(session, sessionManager, globalMutationTracker, {
+      suppressNotifications,
+    });
+    this.activateLiveSessionGlobals(liveSession);
     this.pruneInactiveSessions([String(liveSession.session.sessionId)]);
     return liveSession;
   }
@@ -497,7 +527,16 @@ export class SessionRegistry {
     modified: number | string | Date | undefined;
     messageCount: number | undefined;
   }): ApiSessionListItem {
-    const liveSession = this.liveSessionsByPath.get(sessionInfo.path);
+    const liveSessionByPath = this.liveSessionsByPath.get(sessionInfo.path);
+    const liveSession = liveSessionByPath
+      && this.liveSessions.get(String(liveSessionByPath.session.sessionId)) === liveSessionByPath
+      ? liveSessionByPath
+      : undefined;
+
+    if (liveSessionByPath && !liveSession) {
+      this.liveSessionsByPath.delete(sessionInfo.path);
+    }
+
     const sessionName = sessionInfo.name ? String(sessionInfo.name) : liveSession?.getSessionName();
     const sessionCwd = sessionInfo.cwd ? String(sessionInfo.cwd) : undefined;
 
@@ -529,12 +568,20 @@ export class SessionRegistry {
     return resolve(sessionCwd) === this.cwd;
   }
 
-  private async registerSession(session: AgentSession, sessionManager: PiSessionManager) {
+  private async registerSession(
+    session: AgentSession,
+    sessionManager: PiSessionManager,
+    globalMutationTracker: GlobalMutationTracker,
+    options: {
+      suppressNotifications: boolean;
+    },
+  ) {
     let liveSession!: LiveSession;
     liveSession = new LiveSession(
       session,
       sessionManager,
       (sessionFile) => this.reloadLiveSessionFromDisk(liveSession, sessionFile),
+      globalMutationTracker,
     );
     this.liveSessions.set(String(session.sessionId), liveSession);
     this.cancelScheduledSessionDisposal(String(session.sessionId));
@@ -543,14 +590,21 @@ export class SessionRegistry {
       this.liveSessionsByPath.set(String(session.sessionFile), liveSession);
     }
 
-    await this.bindSessionToLiveSession(session, liveSession);
+    const bindTracker = await this.bindSessionToLiveSession(session, liveSession, options);
+    liveSession.setGlobalMutationTracker(globalMutationTracker.merge(bindTracker));
     return liveSession;
   }
 
-  private async bindSessionToLiveSession(session: AgentSession, liveSession: LiveSession) {
-    await bindSessionExtensions({
+  private async bindSessionToLiveSession(
+    session: AgentSession,
+    liveSession: LiveSession,
+    options: {
+      suppressNotifications: boolean;
+    },
+  ) {
+    const { tracker } = await GlobalMutationTracker.capture(() => bindSessionExtensions({
       session,
-      uiContext: liveSession.createExtensionUiContext(),
+      uiContext: liveSession.createExtensionUiContext({ suppressNotifications: options.suppressNotifications }),
       commandContextActions: {
         waitForIdle: () => session.agent.waitForIdle(),
         newSession: async (options: any) => {
@@ -602,15 +656,35 @@ export class SessionRegistry {
           message: error.error,
         });
       },
-    });
+    }));
+
+    return tracker;
   }
 
   private unregisterLiveSession(liveSession: LiveSession) {
-    this.cancelScheduledSessionDisposal(String(liveSession.session.sessionId));
-    this.liveSessions.delete(String(liveSession.session.sessionId));
+    const sessionId = String(liveSession.session.sessionId);
+    this.cancelScheduledSessionDisposal(sessionId);
+    this.liveSessions.delete(sessionId);
+    if (this.activeGlobalSessionId === sessionId) {
+      this.activeGlobalSessionId = undefined;
+    }
     if (liveSession.session.sessionFile) {
       this.liveSessionsByPath.delete(String(liveSession.session.sessionFile));
     }
+  }
+
+  private activateLiveSessionGlobals(liveSession: LiveSession) {
+    const activeSessionId = String(liveSession.session.sessionId);
+
+    for (const [sessionId, candidate] of this.liveSessions) {
+      if (sessionId === activeSessionId) {
+        continue;
+      }
+      candidate.releaseGlobalMutations();
+    }
+
+    liveSession.restoreGlobalMutations();
+    this.activeGlobalSessionId = activeSessionId;
   }
 
   private syncLiveSessionIdentity(
@@ -624,8 +698,12 @@ export class SessionRegistry {
       this.liveSessionsByPath.delete(previousSessionFile);
     }
 
-    this.liveSessions.set(String(liveSession.session.sessionId), liveSession);
-    this.cancelScheduledSessionDisposal(String(liveSession.session.sessionId));
+    const nextSessionId = String(liveSession.session.sessionId);
+    this.liveSessions.set(nextSessionId, liveSession);
+    this.cancelScheduledSessionDisposal(nextSessionId);
+    if (this.activeGlobalSessionId === previousSessionId) {
+      this.activeGlobalSessionId = nextSessionId;
+    }
     if (liveSession.session.sessionFile) {
       this.liveSessionsByPath.set(String(liveSession.session.sessionFile), liveSession);
     }
