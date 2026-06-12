@@ -15,6 +15,8 @@
     "build": "bun run --filter @pi-web-app/shared build && bun run --filter @pi-web-app/client build && bun run --filter @pi-web-app/server build",
     "check": "bun run --filter @pi-web-app/shared build && bun run --filter @pi-web-app/client check && bun run --filter @pi-web-app/server check",
     "start": "bun run --filter @pi-web-app/server start",
+    "start:pipane": "./scripts/pipane.sh",
+    "start:tailscale": "./scripts/pipane.sh",
     "e2e:prepare": "bun ./scripts/e2e-prepare.ts",
     "e2e:serve": "bun run e2e:prepare && bun run build && bun run start",
     "e2e": "bunx playwright test",

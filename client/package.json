@@ -9,7 +9,7 @@
     "check": "bunx tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@mariozechner/pi-web-ui": "^0.57.1",
+    "@earendil-works/pi-web-ui": "^0.75.3",
     "@pi-web-app/shared": "workspace:*",
     "highlight.js": "^11.11.1",
     "lit": "^3.3.2",

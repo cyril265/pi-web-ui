@@ -1060,7 +1060,7 @@ const pastedClipboardImagePathPattern = /(?:^|\/)pi-clipboard-[\w-]+\.(png|jpe?g
 async function addImageAttachments(files: readonly File[]) {
   if (files.length === 0) return;
 
-  const { loadAttachment } = await import("@mariozechner/pi-web-ui");
+  const { loadAttachment } = await import("@earendil-works/pi-web-ui");
   const loaded = await Promise.all(files.map((file) => loadAttachment(file)));
   const images = loaded.filter((a) => a.type === "image");
   const ignoredCount = loaded.length - images.length;
@@ -4087,7 +4087,9 @@ function ansi16ColorToCss(code: number) {
     "#29b8db",
     "#ffffff",
   ];
-  return colors[code];
+  const color = colors[code];
+  if (!color) throw new Error(`Unsupported ANSI color code: ${code}`);
+  return color;
 }
 
 function ansi256ColorToCss(code: number) {
@@ -4227,9 +4229,15 @@ function renderAnsiHtml(text: string) {
           if (code === 38 || code === 48) {
             const { color, nextIndex } = parseAnsiColor(params, paramIndex);
             if (code === 38) {
-              style.fg = color;
-            } else {
+              if (color) {
+                style.fg = color;
+              } else {
+                delete style.fg;
+              }
+            } else if (color) {
               style.bg = color;
+            } else {
+              delete style.bg;
             }
             paramIndex = nextIndex;
           }

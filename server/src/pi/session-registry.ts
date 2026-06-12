@@ -5,10 +5,9 @@ import { join, resolve } from "node:path";
 import {
   AuthStorage,
   createAgentSession,
-  DefaultResourceLoader,
   ModelRegistry,
   SessionManager,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { BUILTIN_SLASH_COMMANDS } from "@pi-web-app/shared";
 import type {
   ApiForkMessage,
@@ -49,6 +48,7 @@ const createSlashCommand = (
 type CreateAgentSessionResult = Awaited<ReturnType<typeof createAgentSession>>;
 type AgentSession = CreateAgentSessionResult["session"];
 type PiSessionManager = ReturnType<typeof SessionManager.create>;
+type SessionShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 
 export class SessionRegistry {
   private readonly authStorage;
@@ -65,7 +65,7 @@ export class SessionRegistry {
   ) {
     this.sessionDir = join(this.agentDir, "sessions");
     this.authStorage = AuthStorage.create(join(this.agentDir, "auth.json"));
-    this.modelRegistry = new ModelRegistry(this.authStorage, join(this.agentDir, "models.json"));
+    this.modelRegistry = ModelRegistry.create(this.authStorage, join(this.agentDir, "models.json"));
     this.startWatchingSessionsDirectory();
   }
 
@@ -151,18 +151,14 @@ export class SessionRegistry {
         }),
       );
 
-    const resourceLoader = new DefaultResourceLoader({
-      cwd: this.getSessionCwd(liveSession),
-      agentDir: this.agentDir,
-    });
-    await resourceLoader.reload();
+    const resourceLoader = (liveSession.session as AgentSession).resourceLoader;
 
     const promptCommands: ApiSlashCommand[] = resourceLoader.getPrompts().prompts.map((template) =>
       createSlashCommand({
         name: template.name,
         description: template.description,
         source: "prompt",
-        location: normalizeSlashCommandLocation(template.source),
+        location: normalizeSlashCommandLocation(template.sourceInfo.scope),
         path: template.filePath,
       }),
     );
@@ -172,7 +168,7 @@ export class SessionRegistry {
         name: `skill:${skill.name}`,
         description: skill.description,
         source: "skill",
-        location: normalizeSlashCommandLocation(skill.source),
+        location: normalizeSlashCommandLocation(skill.sourceInfo.scope),
         path: skill.filePath,
       }),
     );
@@ -280,12 +276,7 @@ export class SessionRegistry {
   async fork(sessionId: string, entryId: string) {
     const liveSession = this.mustGetSession(sessionId);
     this.prepareForSessionMutation(liveSession);
-    const previousSessionId = String(liveSession.session.sessionId);
-    const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
-    const result = await liveSession.session.fork(entryId);
-
-    this.syncLiveSessionIdentity(liveSession, previousSessionId, previousSessionFile);
-    liveSession.resetAfterSessionMutation();
+    const result = await this.forkLiveSession(liveSession, entryId);
 
     return {
       liveSession,
@@ -317,7 +308,7 @@ export class SessionRegistry {
     }
 
     this.unregisterLiveSession(liveSession);
-    liveSession.dispose();
+    await this.disposeLiveSession(liveSession, "reload", sessionFile);
 
     return this.openSessionInternal(sessionFile, true);
   }
@@ -325,7 +316,7 @@ export class SessionRegistry {
   async reloadSession(sessionId: string) {
     const liveSession = this.mustGetSession(sessionId);
     this.prepareForSessionMutation(liveSession);
-    await this.reloadLiveSessionFromDisk(liveSession);
+    await liveSession.session.reload();
     liveSession.publishSnapshot();
     return liveSession;
   }
@@ -361,6 +352,200 @@ export class SessionRegistry {
 
   private prepareForSessionMutation(liveSession: LiveSession) {
     liveSession.expectInternalSessionWrites();
+  }
+
+  private async startNewLiveSession(liveSession: LiveSession, options: any) {
+    const beforeSwitch = await this.emitBeforeSessionSwitch(liveSession, "new");
+    if (beforeSwitch.cancelled) {
+      return beforeSwitch;
+    }
+
+    const sessionManager = SessionManager.create(this.getSessionCwd(liveSession), liveSession.sessionManager.getSessionDir());
+    if (options?.parentSession) {
+      sessionManager.newSession({ parentSession: options.parentSession });
+    }
+
+    await this.emitSessionShutdown(liveSession, "new", sessionManager.getSessionFile());
+    await this.replaceLiveSession(liveSession, sessionManager, {
+      suppressNotifications: false,
+      setup: options?.setup,
+      withSession: options?.withSession,
+    });
+
+    return { cancelled: false };
+  }
+
+  private async forkLiveSession(liveSession: LiveSession, entryId: string, options: any = {}) {
+    const position = options?.position === "at" ? "at" : "before";
+    const beforeFork = await this.emitBeforeSessionFork(liveSession, entryId, position);
+    if (beforeFork.cancelled) {
+      return { cancelled: true, selectedText: undefined };
+    }
+
+    const selectedEntry = liveSession.sessionManager.getEntry(entryId);
+    if (!selectedEntry) {
+      throw new Error("Invalid entry ID for forking");
+    }
+
+    let targetLeafId: string | null;
+    let selectedText: string | undefined;
+    if (position === "at") {
+      targetLeafId = String(selectedEntry.id);
+    } else {
+      if (selectedEntry.type !== "message" || selectedEntry.message?.role !== "user") {
+        throw new Error("Invalid entry ID for forking");
+      }
+      targetLeafId = selectedEntry.parentId ? String(selectedEntry.parentId) : null;
+      selectedText = extractMessageText(selectedEntry.message);
+    }
+
+    let sessionManager: PiSessionManager;
+    const currentSessionManager = liveSession.sessionManager as PiSessionManager;
+    const currentSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
+
+    if (currentSessionManager.isPersisted()) {
+      if (!currentSessionFile) {
+        throw new Error("Persisted session is missing a session file");
+      }
+
+      const sessionDir = currentSessionManager.getSessionDir();
+      if (targetLeafId) {
+        sessionManager = SessionManager.open(currentSessionFile, sessionDir);
+        const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
+        if (!forkedSessionPath) {
+          throw new Error("Failed to create forked session");
+        }
+      } else {
+        sessionManager = SessionManager.create(this.getSessionCwd(liveSession), sessionDir);
+        sessionManager.newSession({ parentSession: currentSessionFile });
+      }
+    } else {
+      sessionManager = currentSessionManager;
+      if (targetLeafId) {
+        sessionManager.createBranchedSession(targetLeafId);
+      } else {
+        sessionManager.newSession(currentSessionFile ? { parentSession: currentSessionFile } : undefined);
+      }
+    }
+
+    await this.emitSessionShutdown(liveSession, "fork", sessionManager.getSessionFile());
+    await this.replaceLiveSession(liveSession, sessionManager, {
+      suppressNotifications: true,
+      withSession: options?.withSession,
+    });
+
+    return { cancelled: false, selectedText };
+  }
+
+  private async switchLiveSession(liveSession: LiveSession, sessionPath: string, options: any = {}) {
+    const beforeSwitch = await this.emitBeforeSessionSwitch(liveSession, "resume", sessionPath);
+    if (beforeSwitch.cancelled) {
+      return beforeSwitch;
+    }
+
+    const sessionManager = SessionManager.open(sessionPath);
+    await this.emitSessionShutdown(liveSession, "resume", sessionManager.getSessionFile());
+    await this.replaceLiveSession(liveSession, sessionManager, {
+      suppressNotifications: sessionManager.getEntries().length > 0,
+      withSession: options?.withSession,
+    });
+
+    return { cancelled: false };
+  }
+
+  private async replaceLiveSession(
+    liveSession: LiveSession,
+    sessionManager: PiSessionManager,
+    options: {
+      suppressNotifications: boolean;
+      setup?: ((sessionManager: PiSessionManager) => Promise<void>) | undefined;
+      withSession?: ((ctx: any) => Promise<void>) | undefined;
+    },
+  ) {
+    const previousSessionId = String(liveSession.session.sessionId);
+    const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
+    let replaced = false;
+
+    liveSession.releaseGlobalMutations();
+    try {
+      const { session, globalMutationTracker } = await this.createSdkSession(resolve(sessionManager.getCwd()), sessionManager);
+      const bindTracker = await this.bindSessionToLiveSession(session, liveSession, {
+        suppressNotifications: options.suppressNotifications,
+      });
+      liveSession.replaceSession(session, sessionManager, globalMutationTracker.merge(bindTracker));
+      replaced = true;
+      this.syncLiveSessionIdentity(liveSession, previousSessionId, previousSessionFile);
+
+      if (options.setup) {
+        await options.setup(liveSession.sessionManager);
+        liveSession.session.agent.state.messages = liveSession.sessionManager.buildSessionContext().messages;
+      }
+
+      if (options.withSession) {
+        await options.withSession(liveSession.session.createReplacedSessionContext());
+      }
+
+      liveSession.resetAfterSessionMutation();
+    } catch (error) {
+      if (!replaced) {
+        liveSession.restoreGlobalMutations();
+      }
+      throw error;
+    }
+  }
+
+  private async emitBeforeSessionSwitch(liveSession: LiveSession, reason: "new" | "resume", targetSessionFile?: string) {
+    const extensionRunner = liveSession.session.extensionRunner;
+    if (!extensionRunner?.hasHandlers?.("session_before_switch")) {
+      return { cancelled: false };
+    }
+
+    const result = await extensionRunner.emit({
+      type: "session_before_switch",
+      reason,
+      ...(targetSessionFile ? { targetSessionFile } : {}),
+    });
+    return { cancelled: result?.cancel === true };
+  }
+
+  private async emitBeforeSessionFork(liveSession: LiveSession, entryId: string, position: "before" | "at") {
+    const extensionRunner = liveSession.session.extensionRunner;
+    if (!extensionRunner?.hasHandlers?.("session_before_fork")) {
+      return { cancelled: false };
+    }
+
+    const result = await extensionRunner.emit({
+      type: "session_before_fork",
+      entryId,
+      position,
+    });
+    return { cancelled: result?.cancel === true };
+  }
+
+  private async emitSessionShutdown(
+    liveSession: LiveSession,
+    reason: SessionShutdownReason,
+    targetSessionFile: string | undefined,
+  ) {
+    const extensionRunner = liveSession.session.extensionRunner;
+    if (!extensionRunner?.hasHandlers?.("session_shutdown")) {
+      return;
+    }
+
+    await extensionRunner.emit({
+      type: "session_shutdown",
+      reason,
+      ...(targetSessionFile ? { targetSessionFile } : {}),
+    });
+  }
+
+  private async disposeLiveSession(
+    liveSession: LiveSession,
+    reason: SessionShutdownReason,
+    targetSessionFile?: string,
+  ) {
+    await this.emitSessionShutdown(liveSession, reason, targetSessionFile);
+    liveSession.dispose();
   }
 
   private async createSdkSession(cwd: string, sessionManager: PiSessionManager) {
@@ -412,6 +597,7 @@ export class SessionRegistry {
 
     try {
       const { session, sessionManager, globalMutationTracker } = await this.createOpenedSession(sessionFile, liveSession);
+      await this.emitSessionShutdown(liveSession, "reload", sessionFile);
       liveSession.replaceSession(session, sessionManager, globalMutationTracker);
       this.syncLiveSessionIdentity(liveSession, previousSessionId, previousSessionFile);
     } catch (error) {
@@ -430,7 +616,7 @@ export class SessionRegistry {
 
     if (existing && forceReload) {
       this.unregisterLiveSession(existing);
-      existing.dispose();
+      await this.disposeLiveSession(existing, "reload", sessionFile);
     }
 
     const { session, sessionManager, globalMutationTracker, suppressNotifications = false } = await this.createOpenedSession(sessionFile);
@@ -609,22 +795,11 @@ export class SessionRegistry {
         waitForIdle: () => session.agent.waitForIdle(),
         newSession: async (options: any) => {
           liveSession.expectInternalSessionWrites();
-          const previousSessionId = String(liveSession.session.sessionId);
-          const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
-          const success = await session.newSession(options);
-          if (success) {
-            this.syncLiveSessionIdentity(liveSession, previousSessionId, previousSessionFile);
-            liveSession.resetAfterSessionMutation();
-          }
-          return { cancelled: !success };
+          return this.startNewLiveSession(liveSession, options);
         },
-        fork: async (entryId: string) => {
+        fork: async (entryId: string, options: any) => {
           liveSession.expectInternalSessionWrites();
-          const previousSessionId = String(liveSession.session.sessionId);
-          const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
-          const result = await session.fork(entryId);
-          this.syncLiveSessionIdentity(liveSession, previousSessionId, previousSessionFile);
-          liveSession.resetAfterSessionMutation();
+          const result = await this.forkLiveSession(liveSession, entryId, options);
           return { cancelled: result.cancelled };
         },
         navigateTree: async (targetId: string, options: any) => {
@@ -633,20 +808,13 @@ export class SessionRegistry {
           liveSession.resetAfterSessionMutation();
           return { cancelled: result.cancelled };
         },
-        switchSession: async (sessionPath: string) => {
+        switchSession: async (sessionPath: string, options: any) => {
           liveSession.expectInternalSessionWrites();
-          const previousSessionId = String(liveSession.session.sessionId);
-          const previousSessionFile = liveSession.session.sessionFile ? String(liveSession.session.sessionFile) : undefined;
-          const success = await session.switchSession(sessionPath);
-          if (success) {
-            this.syncLiveSessionIdentity(liveSession, previousSessionId, previousSessionFile);
-            liveSession.resetAfterSessionMutation();
-          }
-          return { cancelled: !success };
+          return this.switchLiveSession(liveSession, sessionPath, options);
         },
         reload: async () => {
           liveSession.expectInternalSessionWrites();
-          await this.reloadLiveSessionFromDisk(liveSession);
+          await session.reload();
           liveSession.publishSnapshot();
         },
       },
@@ -740,7 +908,9 @@ export class SessionRegistry {
       }
 
       this.unregisterLiveSession(currentLiveSession);
-      currentLiveSession.dispose();
+      void this.disposeLiveSession(currentLiveSession, "quit").catch((error: unknown) => {
+        console.error(`Failed to dispose inactive session: ${getErrorMessage(error)}`);
+      });
     }, LIVE_SESSION_DISPOSE_DELAY_MS);
 
     this.scheduledSessionDisposals.set(sessionId, timeoutId);

@@ -9,9 +9,9 @@ type RegisteredExtensionCommand = {
 type ExtensionCommandContextActions = {
   waitForIdle: () => Promise<void>;
   newSession: (options: any) => Promise<{ cancelled: boolean }>;
-  fork: (entryId: string) => Promise<{ cancelled: boolean }>;
-  navigateTree: (targetId: string, options: any) => Promise<{ cancelled: boolean }>;
-  switchSession: (sessionPath: string) => Promise<{ cancelled: boolean }>;
+  fork: (entryId: string, options?: any) => Promise<{ cancelled: boolean }>;
+  navigateTree: (targetId: string, options?: any) => Promise<{ cancelled: boolean }>;
+  switchSession: (sessionPath: string, options?: any) => Promise<{ cancelled: boolean }>;
   reload: () => Promise<void>;
 };
 
