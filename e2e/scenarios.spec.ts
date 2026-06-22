@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { resolve } from "node:path";
 import {
   activeConversation,
   ARCHIVE_SESSION_TITLE,
@@ -134,6 +135,32 @@ test.describe.serial("broad real-interaction scenarios", () => {
 
     await chooseMenuItem(page, "Default");
     await expect(html).toHaveAttribute("data-display-mode", "default");
+  });
+
+  test("project directory browser stays in the web UI and fills a server path", async ({ page, request }) => {
+    const healthResponse = await request.get("/api/health");
+    await expect(healthResponse).toBeOK();
+    const health = await healthResponse.json() as { cwd: string };
+    const fixtureProjectPath = resolve(health.cwd, "fixture-project");
+
+    await openApp(page, { expectedSessionCount: 3 });
+    await page.getByRole("button", { name: "PROJECT" }).click();
+    await expect(page.getByText("Open project")).toBeVisible();
+
+    await page.getByRole("button", { name: "Browse" }).click();
+    await expect(page.getByText("Browse project directory")).toBeVisible();
+    await expect(page.getByText("This browser lists directories on the Pi Web server")).toBeVisible();
+    await expect(page.getByLabel("Directory path")).toHaveValue(health.cwd);
+
+    await page.getByRole("button", { name: /fixture-project/ }).click();
+    await expect(page.getByLabel("Directory path")).toHaveValue(fixtureProjectPath);
+
+    await page.getByRole("button", { name: "Use this directory" }).click();
+    await expect(page.getByText("Browse project directory")).toHaveCount(0);
+    await expect(page.getByPlaceholder("/path/to/project")).toHaveValue(fixtureProjectPath);
+
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expect(page.getByText("Open project")).toHaveCount(0);
   });
 
   test.describe("mobile sidebar overlay", () => {

@@ -1,13 +1,10 @@
-import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
-import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import Fastify from "fastify";
-import type { ApiImageInput, SessionEvent, ThinkingLevel } from "@pi-web-app/shared";
+import type { ApiDirectoryListing, ApiImageInput, SessionEvent, ThinkingLevel } from "@pi-web-app/shared";
 import { SessionRegistry } from "./pi/session-registry.js";
 
 const host = process.env.HOST ?? "127.0.0.1";
@@ -26,108 +23,53 @@ const clipboardImageMimeTypes: Record<string, string> = {
 
 const sessionRegistry = new SessionRegistry(cwd);
 const app = Fastify({ logger: true });
-const execFileAsync = promisify(execFile);
-
-type ExecFileError = Error & {
-  code?: string | number;
-  stderr?: string;
-};
 
 const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 
-const isExecFileError = (error: unknown): error is ExecFileError => error instanceof Error;
-
-const isDirectoryPickerCancelled = (error: unknown) => {
-  if (!isExecFileError(error)) {
-    return false;
+async function listDirectories(requestedPath?: string): Promise<ApiDirectoryListing> {
+  const directoryPath = requestedPath?.trim() ? resolve(cwd, requestedPath.trim()) : cwd;
+  const directoryStats = await stat(directoryPath).catch(() => undefined);
+  if (!directoryStats?.isDirectory()) {
+    throw new Error(`Directory not found: ${directoryPath}`);
   }
 
-  const message = `${error.message}\n${error.stderr ?? ""}`.toLowerCase();
-  return error.code === 1 || error.code === "1" || message.includes("user canceled") || message.includes("canceled");
-};
+  const entries = await readdir(directoryPath, { withFileTypes: true }).catch((error: unknown) => {
+    throw new Error(`Failed to read directory: ${getErrorMessage(error)}`);
+  });
+  const parentPath = dirname(directoryPath);
 
-const escapeAppleScriptString = (value: string) => value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
-const escapePowerShellString = (value: string) => value.replaceAll("'", "''");
-
-async function selectDirectory(initialPath?: string) {
-  const defaultPath = initialPath?.trim() ? resolve(cwd, initialPath.trim()) : cwd;
-
-  if (process.platform === "darwin") {
-    const script = `
-set defaultLocation to POSIX file "/" as alias
-try
-  set defaultLocation to POSIX file "${escapeAppleScriptString(defaultPath)}" as alias
-end try
-set chosenFolder to choose folder with prompt "Select a project directory" default location defaultLocation
-POSIX path of chosenFolder
-`;
-
-    try {
-      const { stdout } = await execFileAsync("osascript", ["-e", script]);
-      return stdout.trim() || undefined;
-    } catch (error) {
-      if (isDirectoryPickerCancelled(error)) {
-        return undefined;
-      }
-      throw new Error(`Failed to open the macOS directory picker: ${getErrorMessage(error)}`);
+  const directories = await Promise.all(entries.map(async (entry) => {
+    const entryPath = resolve(directoryPath, entry.name);
+    if (entry.isDirectory()) {
+      return {
+        name: entry.name,
+        path: entryPath,
+      };
     }
-  }
 
-  if (process.platform === "win32") {
-    const script = [
-      "Add-Type -AssemblyName System.Windows.Forms",
-      "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
-      "$dialog.Description = 'Select a project directory'",
-      `$dialog.SelectedPath = '${escapePowerShellString(defaultPath)}'`,
-      "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }",
-    ].join("; ");
-
-    try {
-      const { stdout } = await execFileAsync("powershell", ["-NoProfile", "-STA", "-Command", script]);
-      return stdout.trim() || undefined;
-    } catch (error) {
-      if (isDirectoryPickerCancelled(error)) {
-        return undefined;
-      }
-      throw new Error(`Failed to open the Windows directory picker: ${getErrorMessage(error)}`);
-    }
-  }
-
-  try {
-    const { stdout } = await execFileAsync("zenity", [
-      "--file-selection",
-      "--directory",
-      "--title=Select a project directory",
-      `--filename=${defaultPath.endsWith("/") ? defaultPath : `${defaultPath}/`}`,
-    ]);
-    return stdout.trim() || undefined;
-  } catch (error) {
-    if (isDirectoryPickerCancelled(error)) {
+    if (!entry.isSymbolicLink()) {
       return undefined;
     }
-    if (isExecFileError(error) && error.code !== "ENOENT") {
-      throw new Error(`Failed to open the Linux directory picker: ${getErrorMessage(error)}`);
-    }
-  }
 
-  try {
-    const { stdout } = await execFileAsync("kdialog", ["--getexistingdirectory", defaultPath, "--title", "Select a project directory"]);
-    return stdout.trim() || undefined;
-  } catch (error) {
-    if (isDirectoryPickerCancelled(error)) {
+    const entryStats = await stat(entryPath).catch(() => undefined);
+    if (!entryStats?.isDirectory()) {
       return undefined;
     }
-    if (isExecFileError(error) && error.code === "ENOENT") {
-      throw new Error("No supported directory picker found. Paste a path manually.");
-    }
-    throw new Error(`Failed to open the Linux directory picker: ${getErrorMessage(error)}`);
-  }
+
+    return {
+      name: entry.name,
+      path: entryPath,
+    };
+  }));
+
+  return {
+    path: directoryPath,
+    parentPath: parentPath === directoryPath ? undefined : parentPath,
+    directories: directories
+      .filter((entry): entry is ApiDirectoryListing["directories"][number] => Boolean(entry))
+      .sort((left, right) => left.name.localeCompare(right.name)),
+  };
 }
-
-await app.register(cors, {
-  origin: true,
-  credentials: true,
-});
 
 app.get("/api/health", async () => ({
   ok: true,
@@ -169,15 +111,11 @@ app.get<{ Querystring: { scope?: "current" | "all" } }>("/api/sessions", async (
   sessions: await sessionRegistry.listSessions(request.query.scope === "all" ? "all" : "current"),
 }));
 
-app.post<{ Body: { initialPath?: string } }>("/api/directories/select", async (request, reply) => {
+app.get<{ Querystring: { path?: string } }>("/api/directories", async (request, reply) => {
   try {
-    const path = await selectDirectory(request.body?.initialPath);
-    return {
-      cancelled: !path,
-      path,
-    };
+    return await listDirectories(request.query.path);
   } catch (error) {
-    return reply.code(500).type("text/plain").send(getErrorMessage(error));
+    return reply.code(400).type("text/plain").send(getErrorMessage(error));
   }
 });
 

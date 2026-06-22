@@ -20,6 +20,7 @@ import type {
   ApiExtensionStatusEntry,
   ApiExtensionSurface,
   ApiExtensionUiRequest,
+  ApiDirectoryListing,
   ApiExtensionWidget,
   ApiForkMessage,
   ApiImageInput,
@@ -137,9 +138,15 @@ type AppState = {
   showThinkingLevels: boolean;
   showActions: boolean;
   showCreateProjectDialog: boolean;
+  showProjectDirectoryBrowser: boolean;
   newProjectPath: string;
   newProjectError: string | undefined;
-  isPickingProjectDirectory: boolean;
+  directoryBrowserPath: string;
+  directoryBrowserLoadedPath: string | undefined;
+  directoryBrowserParentPath: string | undefined;
+  directoryBrowserEntries: ApiDirectoryListing["directories"];
+  directoryBrowserError: string | undefined;
+  isLoadingProjectDirectories: boolean;
   isCreatingProjectSession: boolean;
   showTokenUsage: boolean;
   error: string | undefined;
@@ -240,9 +247,15 @@ const state: AppState = {
   showThinkingLevels: false,
   showActions: false,
   showCreateProjectDialog: false,
+  showProjectDirectoryBrowser: false,
   newProjectPath: "",
   newProjectError: undefined,
-  isPickingProjectDirectory: false,
+  directoryBrowserPath: "",
+  directoryBrowserLoadedPath: undefined,
+  directoryBrowserParentPath: undefined,
+  directoryBrowserEntries: [],
+  directoryBrowserError: undefined,
+  isLoadingProjectDirectories: false,
   isCreatingProjectSession: false,
   showTokenUsage: (localStorage.getItem("showTokenUsage") ?? "true") === "true",
   error: undefined,
@@ -263,6 +276,7 @@ let eventReconnectTimeout: ReturnType<typeof setTimeout> | undefined;
 let eventReconnectAttempts = 0;
 let sessionsLoadRequestId = 0;
 let slashCommandsLoadRequestId = 0;
+let directoryBrowserLoadRequestId = 0;
 const levels: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 let messagesContainer: HTMLElement | null = null;
 let renderRequested = false;
@@ -665,32 +679,98 @@ function openCreateProjectDialog() {
 }
 
 function closeCreateProjectDialog() {
-  if (state.isPickingProjectDirectory || state.isCreatingProjectSession) {
+  if (state.isCreatingProjectSession) {
     return;
   }
   state.showCreateProjectDialog = false;
+  state.showProjectDirectoryBrowser = false;
   state.newProjectError = undefined;
   requestRender();
 }
 
-async function pickProjectDirectory() {
-  state.newProjectError = undefined;
-  state.isPickingProjectDirectory = true;
+function openProjectDirectoryBrowser() {
+  state.showProjectDirectoryBrowser = true;
+  state.directoryBrowserPath = (state.newProjectPath.trim() || getActiveSessionListItem()?.cwd) ?? "";
+  state.directoryBrowserLoadedPath = undefined;
+  state.directoryBrowserParentPath = undefined;
+  state.directoryBrowserEntries = [];
+  state.directoryBrowserError = undefined;
+  requestRender();
+  void loadProjectDirectories(state.directoryBrowserPath);
+}
+
+function closeProjectDirectoryBrowser() {
+  state.showProjectDirectoryBrowser = false;
+  state.directoryBrowserError = undefined;
+  requestRender();
+}
+
+async function loadProjectDirectories(path?: string) {
+  const requestId = ++directoryBrowserLoadRequestId;
+  const requestedPath = path?.trim();
+  state.directoryBrowserError = undefined;
+  state.directoryBrowserLoadedPath = undefined;
+  state.directoryBrowserParentPath = undefined;
+  state.directoryBrowserEntries = [];
+  state.isLoadingProjectDirectories = true;
   requestRender();
 
   try {
-    const response = await apiPost<{ cancelled: boolean; path?: string }>("/api/directories/select", {
-      initialPath: state.newProjectPath.trim() || getActiveSessionListItem()?.cwd,
-    });
-    if (response.path) {
-      state.newProjectPath = response.path;
+    const response = await apiGet<ApiDirectoryListing>(
+      requestedPath ? `/api/directories?path=${encodeURIComponent(requestedPath)}` : "/api/directories",
+    );
+    if (requestId !== directoryBrowserLoadRequestId) {
+      return;
     }
+
+    state.directoryBrowserPath = response.path;
+    state.directoryBrowserLoadedPath = response.path;
+    state.directoryBrowserParentPath = response.parentPath;
+    state.directoryBrowserEntries = response.directories;
   } catch (error) {
-    state.newProjectError = getErrorMessage(error);
+    if (requestId === directoryBrowserLoadRequestId) {
+      state.directoryBrowserError = getErrorMessage(error);
+    }
   } finally {
-    state.isPickingProjectDirectory = false;
-    requestRender();
+    if (requestId === directoryBrowserLoadRequestId) {
+      state.isLoadingProjectDirectories = false;
+      requestRender();
+    }
   }
+}
+
+function updateDirectoryBrowserPath(event: Event) {
+  const target = event.target as HTMLInputElement;
+  state.directoryBrowserPath = target.value;
+  state.directoryBrowserError = undefined;
+  requestRender();
+}
+
+function handleDirectoryBrowserPathKeyDown(event: KeyboardEvent) {
+  if (event.key !== "Enter") {
+    return;
+  }
+  event.preventDefault();
+  void loadProjectDirectories(state.directoryBrowserPath);
+}
+
+function useDirectoryBrowserPath() {
+  const directoryPath = state.directoryBrowserPath.trim();
+  if (!directoryPath) {
+    state.directoryBrowserError = "Project directory is required.";
+    requestRender();
+    return;
+  }
+  if (directoryPath !== state.directoryBrowserLoadedPath) {
+    state.directoryBrowserError = "Open this directory first.";
+    requestRender();
+    return;
+  }
+
+  state.newProjectPath = directoryPath;
+  state.newProjectError = undefined;
+  state.showProjectDirectoryBrowser = false;
+  requestRender();
 }
 
 async function createProjectSession() {
@@ -719,6 +799,7 @@ async function createProjectSession() {
     }
 
     state.showCreateProjectDialog = false;
+    state.showProjectDirectoryBrowser = false;
     closeSidebarIfMobile();
   } catch (error) {
     if (!isAbortError(error)) {
@@ -3786,6 +3867,7 @@ const template = () => {
 
     <!-- Dialogs -->
     ${state.showCreateProjectDialog ? renderCreateProjectDialog() : nothing}
+    ${state.showProjectDirectoryBrowser ? renderProjectDirectoryBrowser() : nothing}
     ${state.showModels ? renderModelsDialog() : nothing}
     ${state.showThinkingLevels ? renderThinkingLevelsDialog() : nothing}
     ${state.showActions ? renderActionsDialog() : nothing}
@@ -4339,7 +4421,7 @@ function renderCreateProjectDialog() {
       <div class="pp-dialog" @click=${(event: Event) => event.stopPropagation()}>
         <div class="pp-dialog-title">Open project</div>
         <div class="pp-dialog-subtitle">
-          Choose the directory for the new session. You can paste a path or use the native picker.
+          Choose a directory on the machine running Pi Web. You can paste a path or browse it here.
         </div>
         <div class="pp-dialog-section">
           <div class="pp-dialog-section-title">Project directory</div>
@@ -4353,8 +4435,8 @@ function renderCreateProjectDialog() {
               @input=${updateNewProjectPath}
               @keydown=${handleCreateProjectPathKeyDown}
             />
-            <button class="pp-dialog-btn" @click=${() => void pickProjectDirectory()} ?disabled=${state.isPickingProjectDirectory || state.isCreatingProjectSession}>
-              ${state.isPickingProjectDirectory ? "Browsing…" : "Browse"}
+            <button class="pp-dialog-btn" @click=${openProjectDirectoryBrowser} ?disabled=${state.isCreatingProjectSession}>
+              Browse
             </button>
           </div>
           ${state.newProjectError
@@ -4362,11 +4444,73 @@ function renderCreateProjectDialog() {
             : nothing}
         </div>
         <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
-          <button class="pp-dialog-btn" @click=${closeCreateProjectDialog} ?disabled=${state.isCreatingProjectSession || state.isPickingProjectDirectory}>
+          <button class="pp-dialog-btn" @click=${closeCreateProjectDialog} ?disabled=${state.isCreatingProjectSession}>
             Cancel
           </button>
-          <button class="pp-dialog-btn primary" @click=${() => void createProjectSession()} ?disabled=${state.isCreatingProjectSession || state.isPickingProjectDirectory}>
+          <button class="pp-dialog-btn primary" @click=${() => void createProjectSession()} ?disabled=${state.isCreatingProjectSession}>
             ${state.isCreatingProjectSession ? "Creating…" : "Create session"}
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderProjectDirectoryBrowser() {
+  const canUseDirectory = !state.isLoadingProjectDirectories
+    && state.directoryBrowserPath.trim() === state.directoryBrowserLoadedPath;
+
+  return html`
+    <div class="pp-dialog-overlay" @click=${closeProjectDirectoryBrowser}>
+      <div class="pp-dialog pp-directory-browser-dialog" @click=${(event: Event) => event.stopPropagation()}>
+        <div class="pp-dialog-title">Browse project directory</div>
+        <div class="pp-dialog-subtitle">
+          This browser lists directories on the Pi Web server, so the selected path works for the agent session.
+        </div>
+
+        <div class="pp-directory-browser-path-row">
+          <input
+            class="pp-dialog-input pp-directory-browser-path-input"
+            type="text"
+            aria-label="Directory path"
+            .value=${state.directoryBrowserPath}
+            @input=${updateDirectoryBrowserPath}
+            @keydown=${handleDirectoryBrowserPathKeyDown}
+          />
+          <button class="pp-dialog-btn" @click=${() => void loadProjectDirectories(state.directoryBrowserPath)} ?disabled=${state.isLoadingProjectDirectories}>
+            Go
+          </button>
+        </div>
+
+        <div class="pp-directory-browser-toolbar">
+          <button
+            class="pp-dialog-btn"
+            @click=${() => state.directoryBrowserParentPath ? void loadProjectDirectories(state.directoryBrowserParentPath) : undefined}
+            ?disabled=${state.isLoadingProjectDirectories || !state.directoryBrowserParentPath}
+          >Up</button>
+        </div>
+
+        ${state.directoryBrowserError
+          ? html`<div class="pp-error" style="margin-bottom:0.75rem;">${state.directoryBrowserError}</div>`
+          : nothing}
+
+        <div class="pp-directory-browser-list" aria-label="Directories">
+          ${state.isLoadingProjectDirectories
+            ? html`<div class="pp-dialog-empty">Loading directories…</div>`
+            : state.directoryBrowserEntries.length > 0
+              ? state.directoryBrowserEntries.map((entry) => html`
+                  <button class="pp-dialog-item pp-directory-browser-entry" @click=${() => void loadProjectDirectories(entry.path)}>
+                    <div class="pp-dialog-item-title">${entry.name}</div>
+                    <div class="pp-dialog-item-desc">${entry.path}</div>
+                  </button>
+                `)
+              : html`<div class="pp-dialog-empty">No subdirectories.</div>`}
+        </div>
+
+        <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
+          <button class="pp-dialog-btn" @click=${closeProjectDirectoryBrowser}>Cancel</button>
+          <button class="pp-dialog-btn primary" @click=${useDirectoryBrowserPath} ?disabled=${!canUseDirectory}>
+            Use this directory
           </button>
         </div>
       </div>

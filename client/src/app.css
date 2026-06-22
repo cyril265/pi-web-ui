@@ -1949,6 +1949,33 @@ button:not(:disabled) {
   border-color: var(--pp-accent);
 }
 
+.pp-directory-browser-dialog {
+  max-width: 42rem;
+}
+
+.pp-directory-browser-path-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.pp-directory-browser-toolbar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.pp-directory-browser-list {
+  max-height: 40dvh;
+  overflow-y: auto;
+  margin-bottom: 1rem;
+}
+
+.pp-directory-browser-entry {
+  overflow-wrap: anywhere;
+}
+
 .pp-dialog-item {
   width: 100%;
   padding: 0.5rem 0.75rem;

@@ -81,6 +81,17 @@ export interface ApiSessionListItem {
   externallyDirty: boolean;
 }
 
+export interface ApiDirectoryEntry {
+  name: string;
+  path: string;
+}
+
+export interface ApiDirectoryListing {
+  path: string;
+  parentPath: string | undefined;
+  directories: ApiDirectoryEntry[];
+}
+
 export interface ApiContextUsage {
   tokens: number;
   contextWindow: number;
