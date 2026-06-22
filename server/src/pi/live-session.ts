@@ -1150,6 +1150,10 @@ export class LiveSession {
         this.publishSnapshot();
         return;
       }
+      case "agent_end": {
+        void this.session.agent.waitForIdle().then(() => this.publishSessionPatch());
+        break;
+      }
       default:
         break;
     }
