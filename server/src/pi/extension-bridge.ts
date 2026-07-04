@@ -18,6 +18,13 @@ type ExtensionCommandContextActions = {
 type BridgeableSession = {
   extensionRunner?: {
     getRegisteredCommandsWithPaths?: () => RegisteredExtensionCommand[];
+    getRegisteredCommands?: () => Array<{
+      name: string;
+      description?: string;
+      sourceInfo?: {
+        path?: string;
+      };
+    }>;
   };
   bindExtensions: (options: {
     uiContext: any;
@@ -30,7 +37,19 @@ type BridgeableSession = {
 const asBridgeableSession = (session: unknown) => session as BridgeableSession;
 
 export function getRegisteredExtensionCommands(session: unknown): RegisteredExtensionCommand[] {
-  return asBridgeableSession(session).extensionRunner?.getRegisteredCommandsWithPaths?.() ?? [];
+  const extensionRunner = asBridgeableSession(session).extensionRunner;
+  const commandsWithPaths = extensionRunner?.getRegisteredCommandsWithPaths?.();
+  if (commandsWithPaths) {
+    return commandsWithPaths;
+  }
+
+  return extensionRunner?.getRegisteredCommands?.().map((command) => ({
+    command: {
+      name: command.name,
+      ...(command.description ? { description: command.description } : {}),
+    },
+    ...(command.sourceInfo?.path ? { extensionPath: command.sourceInfo.path } : {}),
+  })) ?? [];
 }
 
 export async function bindSessionExtensions(options: {

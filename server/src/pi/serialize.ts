@@ -12,20 +12,26 @@ const THINKING_START_MARKER = "<<<pi-thinking>>>";
 const THINKING_END_MARKER = "<<<pi-thinking-end>>>";
 
 export const serializeModel = (model: any): ApiModelInfo | undefined => {
-  if (!model?.provider || !model?.id) return undefined;
+  const provider = typeof model?.provider === "string" ? model.provider.trim() : "";
+  const id = typeof model?.id === "string" ? model.id.trim() : "";
+  if (!provider || !id || (provider === "unknown" && id === "unknown")) return undefined;
 
   return {
-    provider: String(model.provider),
-    id: String(model.id),
-    name: String(model.name ?? model.id),
+    provider,
+    id,
+    name: String(model.name ?? id),
   };
 };
 
 export const serializeMessage = (message: any, index: number): ApiMessage | undefined => {
   const parts = serializeMessageParts(message);
+  const rawRole = String(message?.role ?? "unknown");
+  const role = rawRole === "user" && parts.some((part) => part.type === "image")
+    ? "user-with-attachments"
+    : rawRole;
   const serializedMessage: ApiMessage = {
     id: String(message?.id ?? `${message?.role ?? "message"}-${index}`),
-    role: String(message?.role ?? "unknown"),
+    role,
     text: extractMessageText(message),
     timestamp: message?.timestamp ? String(message.timestamp) : undefined,
     ...(typeof message?.isError === "boolean" ? { isError: message.isError } : {}),
@@ -139,7 +145,7 @@ export const extractMessageText = (message: any): string => {
         if (part?.type === "thinking") return formatThinkingPart(part);
         const partText = extractTextPart(part);
         if (partText) return partText;
-        if (part?.type === "image") return `[image: ${part?.source?.mediaType ?? "unknown"}]`;
+        if (part?.type === "image") return `[image: ${getImageMimeType(part) ?? "unknown"}]`;
         if (part?.type === "toolCall") {
           return formatToolCall(part);
         }
@@ -164,6 +170,13 @@ const extractTextPart = (part: any): string | undefined => {
   if (typeof part?.text === "string") return part.text;
   if (typeof part?.content === "string") return part.content;
   if (typeof part?.thinking === "string") return part.thinking;
+  return undefined;
+};
+
+const getImageMimeType = (part: any): string | undefined => {
+  if (typeof part?.mimeType === "string" && part.mimeType.trim()) return part.mimeType.trim();
+  if (typeof part?.source?.mediaType === "string" && part.source.mediaType.trim()) return part.source.mediaType.trim();
+  if (typeof part?.source?.media_type === "string" && part.source.media_type.trim()) return part.source.media_type.trim();
   return undefined;
 };
 
@@ -214,14 +227,9 @@ const serializeMessagePart = (part: any): ApiMessageContentPart | undefined => {
   }
 
   if (part?.type === "image") {
-    const mimeType = typeof part?.source?.mediaType === "string" && part.source.mediaType.trim()
-      ? part.source.mediaType.trim()
-      : typeof part?.mimeType === "string" && part.mimeType.trim()
-        ? part.mimeType.trim()
-        : "unknown";
     return {
       type: "image",
-      mimeType,
+      mimeType: getImageMimeType(part) ?? "unknown",
     };
   }
 

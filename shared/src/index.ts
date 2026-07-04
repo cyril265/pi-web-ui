@@ -195,6 +195,10 @@ export interface ApiExtensionSurface {
   lines: string[];
 }
 
+export type SessionCatalogEvent = {
+  type: "sessions_changed";
+};
+
 export type SessionEvent =
   | {
       type: "snapshot";

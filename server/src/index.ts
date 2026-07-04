@@ -4,7 +4,7 @@ import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import fastifyStatic from "@fastify/static";
 import Fastify from "fastify";
-import type { ApiDirectoryListing, ApiImageInput, SessionEvent, ThinkingLevel } from "@pi-web-app/shared";
+import type { ApiDirectoryListing, ApiImageInput, SessionCatalogEvent, SessionEvent, ThinkingLevel } from "@pi-web-app/shared";
 import { SessionRegistry } from "./pi/session-registry.js";
 
 const host = process.env.HOST ?? "127.0.0.1";
@@ -135,6 +135,33 @@ app.post<{ Body: { path: string } }>("/api/sessions/open", async (request) => {
   return {
     snapshot: liveSession.getSnapshot(),
   };
+});
+
+app.get("/api/sessions/events", async (request, reply) => {
+  reply.hijack();
+  reply.raw.setHeader("Content-Type", "text/event-stream");
+  reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
+  reply.raw.setHeader("Connection", "keep-alive");
+  reply.raw.flushHeaders();
+
+  const sendEvent = (event: SessionCatalogEvent) => {
+    reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+
+  const unsubscribe = sessionRegistry.subscribeToSessionListChanges(() => {
+    sendEvent({ type: "sessions_changed" });
+  });
+  const keepAlive = setInterval(() => {
+    reply.raw.write(": keepalive\n\n");
+  }, 15_000);
+
+  request.raw.on("close", () => {
+    clearInterval(keepAlive);
+    unsubscribe();
+    if (!reply.raw.writableEnded) {
+      reply.raw.end();
+    }
+  });
 });
 
 app.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId", async (request, reply) => {

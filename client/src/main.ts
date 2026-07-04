@@ -1,27 +1,8 @@
 import { html, render, nothing } from "lit";
 import { live } from "lit/directives/live.js";
-import { unsafeHTML } from "lit/directives/unsafe-html.js";
-import { marked } from "marked";
-import hljs from "highlight.js/lib/core";
-import bash from "highlight.js/lib/languages/bash";
-import css from "highlight.js/lib/languages/css";
-import diff from "highlight.js/lib/languages/diff";
-import javascript from "highlight.js/lib/languages/javascript";
-import json from "highlight.js/lib/languages/json";
-import markdown from "highlight.js/lib/languages/markdown";
-import plaintext from "highlight.js/lib/languages/plaintext";
-import python from "highlight.js/lib/languages/python";
-import typescript from "highlight.js/lib/languages/typescript";
-import xml from "highlight.js/lib/languages/xml";
-import yaml from "highlight.js/lib/languages/yaml";
 import { BUILTIN_SLASH_COMMANDS } from "@pi-web-app/shared";
 import type {
-  ApiExtensionNotification,
-  ApiExtensionStatusEntry,
-  ApiExtensionSurface,
-  ApiExtensionUiRequest,
   ApiDirectoryListing,
-  ApiExtensionWidget,
   ApiForkMessage,
   ApiImageInput,
   ApiModelInfo,
@@ -30,9 +11,21 @@ import type {
   ApiSessionPatch,
   ApiSessionSnapshot,
   ApiTreeMessage,
+  SessionCatalogEvent,
   SessionEvent,
   ThinkingLevel,
 } from "@pi-web-app/shared";
+import {
+  clearRenderedMessageCaches,
+  copyMessageText,
+  handleCodeCopyClick,
+  isUserPromptMessage,
+  renderConversation,
+  renderToolCard,
+} from "./conversation-rendering";
+import type { MessageActionContext } from "./conversation-rendering";
+import { ExtensionUi } from "./extension-ui";
+import { ProjectSessionDialog } from "./project-session-dialog";
 import "./app.css";
 
 /* ─── Types ─── */
@@ -57,22 +50,6 @@ type PendingComposerSubmission = {
 type ThemeMode = "light" | "dark" | "system";
 type ColorTheme = "default" | "gruvbox" | "ghostty";
 type DisplayMode = "default" | "dense";
-type ParsedToolCallMessage = {
-  toolName: string;
-  toolCallId: string | undefined;
-  arguments: unknown;
-  preview: string | undefined;
-};
-type AssistantMessagePart =
-  | { type: "markdown"; text: string }
-  | { type: "thinking"; text: string }
-  | { type: "toolCall"; toolCall: ParsedToolCallMessage };
-type ToolResultMessage = Pick<ApiSessionSnapshot["messages"][number], "text" | "isError" | "toolCallId">;
-type ToolActivityState = "call" | ApiSessionSnapshot["toolExecutions"][number]["status"];
-type ConversationRenderResult = {
-  entries: ReturnType<typeof html>[];
-  remainingToolExecutions: ApiSessionSnapshot["toolExecutions"];
-};
 type LiveConnectionState = "disconnected" | "connecting" | "connected" | "reconnecting";
 type ApiRequestOptions = {
   signal?: AbortSignal;
@@ -80,15 +57,6 @@ type ApiRequestOptions = {
 type SessionSelection = {
   token: number;
   signal: AbortSignal;
-};
-type UserPromptMessage = ApiSessionSnapshot["messages"][number] & {
-  role: "user" | "user-with-attachments";
-};
-type MessageActionContext = {
-  promptMessage: ApiSessionSnapshot["messages"][number];
-  promptOrdinal: number;
-  selectedMessage: ApiSessionSnapshot["messages"][number];
-  usesNearestPrompt: boolean;
 };
 type MessageActionTarget = {
   entryId: string;
@@ -119,13 +87,6 @@ type AppState = {
   pendingComposerSubmissions: PendingComposerSubmission[];
   forkMessages: ApiForkMessage[];
   treeMessages: ApiTreeMessage[];
-  pendingExtensionUi: ApiExtensionUiRequest | undefined;
-  extensionUiValue: string;
-  extensionNotifications: ApiExtensionNotification[];
-  extensionStatuses: ApiExtensionStatusEntry[];
-  extensionWidgets: ApiExtensionWidget[];
-  extensionHeader: ApiExtensionSurface | undefined;
-  extensionFooter: ApiExtensionSurface | undefined;
   pageTitle: string | undefined;
   renameText: string;
   isLoading: boolean;
@@ -137,17 +98,6 @@ type AppState = {
   showModels: boolean;
   showThinkingLevels: boolean;
   showActions: boolean;
-  showCreateProjectDialog: boolean;
-  showProjectDirectoryBrowser: boolean;
-  newProjectPath: string;
-  newProjectError: string | undefined;
-  directoryBrowserPath: string;
-  directoryBrowserLoadedPath: string | undefined;
-  directoryBrowserParentPath: string | undefined;
-  directoryBrowserEntries: ApiDirectoryListing["directories"];
-  directoryBrowserError: string | undefined;
-  isLoadingProjectDirectories: boolean;
-  isCreatingProjectSession: boolean;
   showTokenUsage: boolean;
   error: string | undefined;
   info: string | undefined;
@@ -158,13 +108,6 @@ type AppState = {
   colorTheme: ColorTheme;
   displayMode: DisplayMode;
   expandedToolCards: Set<string>;
-};
-
-type BoundedTextCache = {
-  values: Map<string, string>;
-  maxEntries: number;
-  maxChars: number;
-  charCount: number;
 };
 
 /* ─── State ─── */
@@ -179,11 +122,6 @@ const FILTER_INPUT_RENDER_DELAY_MS = 100;
 const AUTO_SCROLL_NEAR_BOTTOM_THRESHOLD_PX = 64;
 const DEFAULT_VISIBLE_MESSAGE_WINDOW = 200;
 const MESSAGE_WINDOW_STEP = 200;
-const ASSISTANT_MESSAGE_PARTS_CACHE_LIMIT = 400;
-const MARKDOWN_HTML_CACHE_LIMIT = 200;
-const MARKDOWN_HTML_CACHE_CHAR_LIMIT = 2_000_000;
-const CODE_BLOCK_COPY_CACHE_LIMIT = 200;
-const CODE_BLOCK_COPY_CACHE_CHAR_LIMIT = 1_000_000;
 const sidebarMediaQuery = window.matchMedia(MOBILE_SIDEBAR_MEDIA_QUERY);
 const appRoot = document.getElementById("app");
 
@@ -228,13 +166,6 @@ const state: AppState = {
   pendingComposerSubmissions: [],
   forkMessages: [],
   treeMessages: [],
-  pendingExtensionUi: undefined,
-  extensionUiValue: "",
-  extensionNotifications: [],
-  extensionStatuses: [],
-  extensionWidgets: [],
-  extensionHeader: undefined,
-  extensionFooter: undefined,
   pageTitle: undefined,
   renameText: "",
   isLoading: true,
@@ -246,17 +177,6 @@ const state: AppState = {
   showModels: false,
   showThinkingLevels: false,
   showActions: false,
-  showCreateProjectDialog: false,
-  showProjectDirectoryBrowser: false,
-  newProjectPath: "",
-  newProjectError: undefined,
-  directoryBrowserPath: "",
-  directoryBrowserLoadedPath: undefined,
-  directoryBrowserParentPath: undefined,
-  directoryBrowserEntries: [],
-  directoryBrowserError: undefined,
-  isLoadingProjectDirectories: false,
-  isCreatingProjectSession: false,
   showTokenUsage: (localStorage.getItem("showTokenUsage") ?? "true") === "true",
   error: undefined,
   info: undefined,
@@ -270,36 +190,33 @@ const state: AppState = {
 };
 
 let currentEvents: EventSource | undefined;
+let sessionListEvents: EventSource | undefined;
 let currentSessionSelection = 0;
 let currentSessionSelectionController = new AbortController();
 let eventReconnectTimeout: ReturnType<typeof setTimeout> | undefined;
 let eventReconnectAttempts = 0;
+let sessionListReconnectTimeout: ReturnType<typeof setTimeout> | undefined;
+let sessionListRefreshTimeout: ReturnType<typeof setTimeout> | undefined;
 let sessionsLoadRequestId = 0;
 let slashCommandsLoadRequestId = 0;
-let directoryBrowserLoadRequestId = 0;
 const levels: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 let messagesContainer: HTMLElement | null = null;
 let renderRequested = false;
 let followLatestMessages = true;
 let scrollToBottomRequested = false;
 let scrollToBottomForceRequested = false;
-const emptyMessageActionContexts = new Map<string, MessageActionContext>();
-let cachedMessageActionContextSource: ApiSessionSnapshot["messages"] | undefined;
-let cachedMessageActionContexts = emptyMessageActionContexts;
 const EVENT_RECONNECT_BASE_DELAY_MS = 1_000;
 const EVENT_RECONNECT_MAX_DELAY_MS = 10_000;
+const SESSION_LIST_EVENT_RECONNECT_MS = 3_000;
+const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
+const SIDEBAR_RELATIVE_TIME_REFRESH_MS = 30_000;
 const EXTENSION_LAYOUT_SYNC_DEBOUNCE_MS = 120;
+const SESSION_SWITCH_FEEDBACK_MS = 150;
 let extensionLayoutSyncTimeout: ReturnType<typeof setTimeout> | undefined;
+let sidebarRelativeTimeRefreshInterval: ReturnType<typeof setInterval> | undefined;
 let lastReportedExtensionLayout: { sessionId: string; columns: number } | undefined;
-const EXTENSION_NOTIFICATION_DEDUPE_WINDOW_MS = 3_000;
-const THINKING_START_MARKER = "<<<pi-thinking>>>";
-const THINKING_END_MARKER = "<<<pi-thinking-end>>>";
-const assistantMessagePartsCache = new Map<string, AssistantMessagePart[]>();
-const markdownHtmlCache = createBoundedTextCache(MARKDOWN_HTML_CACHE_LIMIT, MARKDOWN_HTML_CACHE_CHAR_LIMIT);
-const codeBlockCopyCache = createBoundedTextCache(CODE_BLOCK_COPY_CACHE_LIMIT, CODE_BLOCK_COPY_CACHE_CHAR_LIMIT);
 let visibleMessageWindow = DEFAULT_VISIBLE_MESSAGE_WINDOW;
 const sessionDirectoryOverrides = new Map<string, string>();
-const recentExtensionNotifications = new Map<string, number>();
 const requestInputRender = (() => {
   let timeoutId: number | undefined;
   return () => {
@@ -313,128 +230,50 @@ const requestInputRender = (() => {
   };
 })();
 
-function createBoundedTextCache(maxEntries: number, maxChars: number): BoundedTextCache {
-  return {
-    values: new Map<string, string>(),
-    maxEntries,
-    maxChars,
-    charCount: 0,
-  };
-}
-
-function clearBoundedTextCache(cache: BoundedTextCache) {
-  cache.values.clear();
-  cache.charCount = 0;
-}
-
-function getLruCacheValue<K, V>(cache: Map<K, V>, key: K) {
-  const value = cache.get(key);
-  if (value === undefined) return undefined;
-  cache.delete(key);
-  cache.set(key, value);
-  return value;
-}
-
-function setLruCacheValue<K, V>(cache: Map<K, V>, key: K, value: V, maxEntries: number) {
-  if (cache.has(key)) {
-    cache.delete(key);
+function startSidebarRelativeTimeRefresh() {
+  if (sidebarRelativeTimeRefreshInterval !== undefined) {
+    return;
   }
-  cache.set(key, value);
 
-  while (cache.size > maxEntries) {
-    const oldestKey = cache.keys().next().value;
-    if (oldestKey === undefined) {
-      break;
+  sidebarRelativeTimeRefreshInterval = setInterval(() => {
+    if (state.sessions.length > 0) {
+      requestRender();
     }
-    cache.delete(oldestKey);
-  }
+  }, SIDEBAR_RELATIVE_TIME_REFRESH_MS);
 }
 
-function getBoundedTextCacheValue(cache: BoundedTextCache, key: string) {
-  const value = cache.values.get(key);
-  if (value === undefined) return undefined;
-  cache.values.delete(key);
-  cache.values.set(key, value);
-  return value;
-}
+const extensionUi = new ExtensionUi({
+  getSessionId: () => state.activeSession?.sessionId,
+  requestRender,
+  submitResponse: async (sessionId, response) => {
+    await apiPost(`/api/sessions/${sessionId}/ui-response`, response);
+  },
+});
 
-function setBoundedTextCacheValue(cache: BoundedTextCache, key: string, value: string) {
-  const existing = cache.values.get(key);
-  if (existing !== undefined) {
-    cache.values.delete(key);
-    cache.charCount -= existing.length;
-  }
-
-  cache.values.set(key, value);
-  cache.charCount += value.length;
-
-  while (cache.values.size > cache.maxEntries || cache.charCount > cache.maxChars) {
-    const oldestEntry = cache.values.entries().next().value;
-    if (!oldestEntry) {
-      break;
+const projectSessionDialog = new ProjectSessionDialog({
+  getInitialProjectPath: () => getActiveSessionListItem()?.cwd,
+  requestRender,
+  listDirectories: async (path) => await apiGet<ApiDirectoryListing>(
+    path ? `/api/directories?path=${encodeURIComponent(path)}` : "/api/directories",
+  ),
+  createSession: async (projectPath) => Boolean(await createSession(projectPath)),
+  onSessionCreated: (projectPath) => {
+    if (!state.activeSession) {
+      return;
     }
 
-    const [oldestKey, oldestValue] = oldestEntry;
-    cache.values.delete(oldestKey);
-    cache.charCount -= oldestValue.length;
-  }
-}
+    setSessionDirectoryOverride(state.activeSession, projectPath);
 
-function hashText(value: string) {
-  let hash = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(36);
-}
+    const activeSessionListItem = getActiveSessionListItem();
+    if (activeSessionListItem) {
+      activeSessionListItem.cwd = projectPath;
+    }
 
-const HIGHLIGHT_LANGUAGE_ALIASES: Record<string, string> = {
-  bash: "bash",
-  sh: "bash",
-  shell: "bash",
-  zsh: "bash",
-  console: "bash",
-  css: "css",
-  diff: "diff",
-  patch: "diff",
-  javascript: "javascript",
-  js: "javascript",
-  jsx: "javascript",
-  cjs: "javascript",
-  mjs: "javascript",
-  json: "json",
-  jsonc: "json",
-  markdown: "markdown",
-  md: "markdown",
-  plaintext: "plaintext",
-  text: "plaintext",
-  txt: "plaintext",
-  python: "python",
-  py: "python",
-  typescript: "typescript",
-  ts: "typescript",
-  tsx: "typescript",
-  html: "xml",
-  xml: "xml",
-  svg: "xml",
-  yaml: "yaml",
-  yml: "yaml",
-};
+    closeSidebarIfMobile();
+  },
+});
 
-const CODE_LANGUAGE_LABELS: Record<string, string> = {
-  bash: "Bash",
-  css: "CSS",
-  diff: "Diff",
-  javascript: "JavaScript",
-  json: "JSON",
-  markdown: "Markdown",
-  plaintext: "Text",
-  python: "Python",
-  typescript: "TypeScript",
-  xml: "HTML",
-  yaml: "YAML",
-};
+
 
 function formatThinkingLevel(level: ThinkingLevel | undefined) {
   switch (level) {
@@ -460,57 +299,15 @@ function getVisibleThinkingLevels() {
   return currentLevel && !levels.includes(currentLevel) ? [currentLevel, ...levels] : levels;
 }
 
-([
-  ["bash", bash],
-  ["css", css],
-  ["diff", diff],
-  ["javascript", javascript],
-  ["json", json],
-  ["markdown", markdown],
-  ["plaintext", plaintext],
-  ["python", python],
-  ["typescript", typescript],
-  ["xml", xml],
-  ["yaml", yaml],
-] as const).forEach(([language, definition]) => hljs.registerLanguage(language, definition));
 
-marked.use({
-  renderer: {
-    code({ text, lang }) {
-      return `${renderMarkdownCodeBlock(text, lang)}\n`;
-    },
-    table(token) {
-      let header = "";
-      for (const cell of token.header) {
-        header += this.tablecell(cell);
-      }
-
-      const head = this.tablerow({ text: header });
-      let rows = "";
-      for (const row of token.rows) {
-        let body = "";
-        for (const cell of row) {
-          body += this.tablecell(cell);
-        }
-        rows += this.tablerow({ text: body });
-      }
-
-      return `<div class="pp-table-scroll"><table>
-<thead>
-${head}</thead>
-${rows ? `<tbody>${rows}</tbody>` : ""}</table></div>
-`;
-    },
-  },
-});
-
-marked.setOptions({ breaks: true, gfm: true });
 
 /* ─── API / state logic ─── */
 
 async function bootstrap() {
   applyTheme();
   applyDisplayMode();
+  startSidebarRelativeTimeRefresh();
+  connectSessionListEvents();
   try {
     await Promise.all([loadSessions(), loadModels()]);
     const storedSessionFile = getStoredActiveSessionFile();
@@ -579,6 +376,43 @@ function refreshSessionsInBackground(scope = state.sessionsScope) {
     state.error = getErrorMessage(error);
     requestRender();
   });
+}
+
+function scheduleSessionListRefresh() {
+  if (sessionListRefreshTimeout) {
+    clearTimeout(sessionListRefreshTimeout);
+  }
+
+  sessionListRefreshTimeout = setTimeout(() => {
+    sessionListRefreshTimeout = undefined;
+    refreshSessionsInBackground();
+  }, SESSION_LIST_REFRESH_DEBOUNCE_MS);
+}
+
+function connectSessionListEvents() {
+  if (sessionListReconnectTimeout) {
+    clearTimeout(sessionListReconnectTimeout);
+    sessionListReconnectTimeout = undefined;
+  }
+
+  sessionListEvents?.close();
+  const events = new EventSource("/api/sessions/events");
+  sessionListEvents = events;
+
+  events.onmessage = (messageEvent) => {
+    if (sessionListEvents !== events) return;
+    const event = JSON.parse(messageEvent.data) as SessionCatalogEvent;
+    if (event.type === "sessions_changed") {
+      scheduleSessionListRefresh();
+    }
+  };
+
+  events.onerror = () => {
+    if (sessionListEvents !== events) return;
+    events.close();
+    sessionListEvents = undefined;
+    sessionListReconnectTimeout = setTimeout(connectSessionListEvents, SESSION_LIST_EVENT_RECONNECT_MS);
+  };
 }
 
 function refreshSlashCommandsInBackground(sessionId = state.activeSession?.sessionId) {
@@ -670,153 +504,9 @@ async function handleCreateSession() {
   closeSidebarIfMobile();
 }
 
-function openCreateProjectDialog() {
+function openProjectSessionDialog() {
   state.showMenu = false;
-  state.showCreateProjectDialog = true;
-  state.newProjectPath = getActiveSessionListItem()?.cwd ?? state.newProjectPath;
-  state.newProjectError = undefined;
-  requestRender();
-}
-
-function closeCreateProjectDialog() {
-  if (state.isCreatingProjectSession) {
-    return;
-  }
-  state.showCreateProjectDialog = false;
-  state.showProjectDirectoryBrowser = false;
-  state.newProjectError = undefined;
-  requestRender();
-}
-
-function openProjectDirectoryBrowser() {
-  state.showProjectDirectoryBrowser = true;
-  state.directoryBrowserPath = (state.newProjectPath.trim() || getActiveSessionListItem()?.cwd) ?? "";
-  state.directoryBrowserLoadedPath = undefined;
-  state.directoryBrowserParentPath = undefined;
-  state.directoryBrowserEntries = [];
-  state.directoryBrowserError = undefined;
-  requestRender();
-  void loadProjectDirectories(state.directoryBrowserPath);
-}
-
-function closeProjectDirectoryBrowser() {
-  state.showProjectDirectoryBrowser = false;
-  state.directoryBrowserError = undefined;
-  requestRender();
-}
-
-async function loadProjectDirectories(path?: string) {
-  const requestId = ++directoryBrowserLoadRequestId;
-  const requestedPath = path?.trim();
-  state.directoryBrowserError = undefined;
-  state.directoryBrowserLoadedPath = undefined;
-  state.directoryBrowserParentPath = undefined;
-  state.directoryBrowserEntries = [];
-  state.isLoadingProjectDirectories = true;
-  requestRender();
-
-  try {
-    const response = await apiGet<ApiDirectoryListing>(
-      requestedPath ? `/api/directories?path=${encodeURIComponent(requestedPath)}` : "/api/directories",
-    );
-    if (requestId !== directoryBrowserLoadRequestId) {
-      return;
-    }
-
-    state.directoryBrowserPath = response.path;
-    state.directoryBrowserLoadedPath = response.path;
-    state.directoryBrowserParentPath = response.parentPath;
-    state.directoryBrowserEntries = response.directories;
-  } catch (error) {
-    if (requestId === directoryBrowserLoadRequestId) {
-      state.directoryBrowserError = getErrorMessage(error);
-    }
-  } finally {
-    if (requestId === directoryBrowserLoadRequestId) {
-      state.isLoadingProjectDirectories = false;
-      requestRender();
-    }
-  }
-}
-
-function updateDirectoryBrowserPath(event: Event) {
-  const target = event.target as HTMLInputElement;
-  state.directoryBrowserPath = target.value;
-  state.directoryBrowserError = undefined;
-  requestRender();
-}
-
-function handleDirectoryBrowserPathKeyDown(event: KeyboardEvent) {
-  if (event.key !== "Enter") {
-    return;
-  }
-  event.preventDefault();
-  void loadProjectDirectories(state.directoryBrowserPath);
-}
-
-function useDirectoryBrowserPath() {
-  const directoryPath = state.directoryBrowserPath.trim();
-  if (!directoryPath) {
-    state.directoryBrowserError = "Project directory is required.";
-    requestRender();
-    return;
-  }
-  if (directoryPath !== state.directoryBrowserLoadedPath) {
-    state.directoryBrowserError = "Open this directory first.";
-    requestRender();
-    return;
-  }
-
-  state.newProjectPath = directoryPath;
-  state.newProjectError = undefined;
-  state.showProjectDirectoryBrowser = false;
-  requestRender();
-}
-
-async function createProjectSession() {
-  const projectPath = state.newProjectPath.trim();
-  if (!projectPath) {
-    state.newProjectError = "Project directory is required.";
-    requestRender();
-    return;
-  }
-
-  state.newProjectError = undefined;
-  state.isCreatingProjectSession = true;
-  requestRender();
-
-  try {
-    const opened = await createSession(projectPath);
-    if (!opened || !state.activeSession) {
-      return;
-    }
-
-    setSessionDirectoryOverride(state.activeSession, projectPath);
-
-    const activeSessionListItem = getActiveSessionListItem();
-    if (activeSessionListItem) {
-      activeSessionListItem.cwd = projectPath;
-    }
-
-    state.showCreateProjectDialog = false;
-    state.showProjectDirectoryBrowser = false;
-    closeSidebarIfMobile();
-  } catch (error) {
-    if (!isAbortError(error)) {
-      state.newProjectError = getErrorMessage(error);
-    }
-  } finally {
-    state.isCreatingProjectSession = false;
-    requestRender();
-  }
-}
-
-function handleCreateProjectPathKeyDown(event: KeyboardEvent) {
-  if (event.key !== "Enter") {
-    return;
-  }
-  event.preventDefault();
-  void createProjectSession();
+  projectSessionDialog.open();
 }
 
 async function openSession(sessionFile: string) {
@@ -998,9 +688,15 @@ async function setModel(provider: string, modelId: string) {
 }
 
 async function setThinkingLevel(level: ThinkingLevel) {
-  if (!state.activeSession) return;
-  await apiPost(`/api/sessions/${state.activeSession.sessionId}/thinking-level`, { thinkingLevel: level });
+  const activeSession = state.activeSession;
+  if (!activeSession) return;
+  await apiPost(`/api/sessions/${activeSession.sessionId}/thinking-level`, { thinkingLevel: level });
+  if (state.activeSession?.sessionId === activeSession.sessionId) {
+    state.activeSession.thinkingLevel = level;
+    syncSessionListItem(state.activeSession, { touchLastModified: false });
+  }
   state.showThinkingLevels = false;
+  requestRender();
 }
 
 async function openActions() {
@@ -1216,12 +912,7 @@ async function handleComposerPaste(event: ClipboardEvent) {
   }
 }
 
-function clearRenderedMessageCaches() {
-  assistantMessagePartsCache.clear();
-  clearBoundedTextCache(markdownHtmlCache);
-  clearBoundedTextCache(codeBlockCopyCache);
-  clearMessageActionContextCache();
-}
+
 
 function getSessionPreviewFromSnapshot(snapshot: ApiSessionSnapshot) {
   const firstUserMessage = snapshot.messages.find((message) =>
@@ -1384,7 +1075,6 @@ function applyMessagesDelta(fromIndex: number, messages: ApiSessionSnapshot["mes
   }
 
   activeSession.messages = [...activeSession.messages.slice(0, fromIndex), ...messages];
-  clearMessageActionContextCache();
   reconcilePendingComposerSubmissions(activeSession);
   syncSessionListItem(activeSession);
   return true;
@@ -1412,7 +1102,6 @@ function applySnapshot(snapshot: ApiSessionSnapshot, options: { resetSessionUi?:
   const previousSessionId = state.activeSession?.sessionId;
   reconcilePendingComposerSubmissions(snapshot);
   state.activeSession = snapshot;
-  clearMessageActionContextCache();
   const sessionChanged = previousSessionId !== snapshot.sessionId;
   if (sessionChanged) {
     state.expandedToolCards = new Set<string>();
@@ -1425,12 +1114,7 @@ function applySnapshot(snapshot: ApiSessionSnapshot, options: { resetSessionUi?:
   state.renameText = snapshot.title;
   storeActiveSessionFile(snapshot.sessionFile);
   if (options.resetSessionUi) {
-    state.pendingExtensionUi = undefined;
-    state.extensionUiValue = "";
-    state.extensionStatuses = [];
-    state.extensionWidgets = [];
-    state.extensionHeader = undefined;
-    state.extensionFooter = undefined;
+    extensionUi.clearForSessionChange();
   }
   state.pageTitle = snapshot.title;
   document.title = state.pageTitle;
@@ -1500,26 +1184,15 @@ function connectEvents(sessionId: string) {
         state.info = event.message;
         break;
       case "extension_ui_request":
-        state.pendingExtensionUi = event.request;
-        state.extensionUiValue = event.request.prefill ?? "";
-        break;
       case "extension_notify":
-        pushExtensionNotification(event.notification);
+      case "set_status":
+      case "set_widget":
+      case "set_header":
+      case "set_footer":
+        extensionUi.applyEvent(event);
         break;
       case "set_editor_text":
         state.composerText = event.text;
-        break;
-      case "set_status":
-        setExtensionStatus(event.key, event.text);
-        break;
-      case "set_widget":
-        setExtensionWidget(event.key, event.widget);
-        break;
-      case "set_header":
-        state.extensionHeader = event.header;
-        break;
-      case "set_footer":
-        state.extensionFooter = event.footer;
         break;
       case "set_title":
         state.pageTitle = event.title;
@@ -1584,88 +1257,6 @@ async function syncExtensionLayout() {
 function setError(message: string) {
   state.error = message;
   requestRender();
-}
-
-function pushExtensionNotification(notification: ApiExtensionNotification) {
-  const notificationKey = `${notification.notifyType}:${notification.message}`;
-  const now = Date.now();
-  const lastShownAt = recentExtensionNotifications.get(notificationKey);
-  if (lastShownAt !== undefined && now - lastShownAt < EXTENSION_NOTIFICATION_DEDUPE_WINDOW_MS) {
-    return;
-  }
-
-  recentExtensionNotifications.set(notificationKey, now);
-  setTimeout(() => {
-    if (recentExtensionNotifications.get(notificationKey) === now) {
-      recentExtensionNotifications.delete(notificationKey);
-    }
-  }, EXTENSION_NOTIFICATION_DEDUPE_WINDOW_MS).unref?.();
-
-  state.extensionNotifications = [notification, ...state.extensionNotifications].slice(0, 4);
-  setTimeout(() => {
-    state.extensionNotifications = state.extensionNotifications.filter((e) => e.id !== notification.id);
-    requestRender();
-  }, 6_000).unref?.();
-}
-
-function setExtensionStatus(key: string, text: string | undefined) {
-  state.extensionStatuses = text
-    ? [{ key, text }, ...state.extensionStatuses.filter((e) => e.key !== key)]
-    : state.extensionStatuses.filter((e) => e.key !== key);
-}
-
-function isExtensionWidgetPlacement(value: unknown): value is ApiExtensionWidget["placement"] {
-  return value === "aboveEditor" || value === "belowEditor";
-}
-
-function normalizeExtensionWidgetLines(lines: unknown): string[] {
-  if (typeof lines === "string") return [lines];
-  if (!Array.isArray(lines)) return [];
-  return lines.filter((line): line is string => typeof line === "string");
-}
-
-function normalizeExtensionWidget(key: string, widget: unknown): ApiExtensionWidget | undefined {
-  if (widget == null) return undefined;
-  if (typeof widget === "string") {
-    return { key, lines: [widget], placement: "aboveEditor" };
-  }
-  if (!isRecord(widget)) return undefined;
-
-  const linesSource = widget.lines ?? widget.content ?? widget.text;
-  const lines = normalizeExtensionWidgetLines(linesSource);
-  const hasRenderableLines =
-    typeof linesSource === "string" || (Array.isArray(linesSource) && (linesSource.length === 0 || lines.length > 0));
-  if (!hasRenderableLines) return undefined;
-
-  return {
-    key: typeof widget.key === "string" ? widget.key : key,
-    lines,
-    placement: isExtensionWidgetPlacement(widget.placement) ? widget.placement : "aboveEditor",
-  };
-}
-
-function setExtensionWidget(key: string, widget: unknown) {
-  const normalizedWidget = normalizeExtensionWidget(key, widget);
-  state.extensionWidgets = normalizedWidget
-    ? [normalizedWidget, ...state.extensionWidgets.filter((e) => e.key !== key)]
-    : state.extensionWidgets.filter((e) => e.key !== key);
-}
-
-async function submitExtensionUiResponse(response: {
-  value?: string;
-  confirmed?: boolean;
-  cancelled?: boolean;
-}) {
-  if (!state.activeSession || !state.pendingExtensionUi) return;
-  const requestId = state.pendingExtensionUi.id;
-  state.pendingExtensionUi = undefined;
-  requestRender();
-  await apiPost(`/api/sessions/${state.activeSession.sessionId}/ui-response`, {
-    id: requestId,
-    value: response.value,
-    confirmed: response.confirmed,
-    cancelled: response.cancelled,
-  });
 }
 
 /* ─── Theme ─── */
@@ -1749,6 +1340,12 @@ function handleSidebarViewportChange(event: MediaQueryListEvent | MediaQueryList
 function waitForNextPaint() {
   return new Promise<void>((resolve) => {
     requestAnimationFrame(() => resolve());
+  });
+}
+
+function delay(milliseconds: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, milliseconds);
   });
 }
 
@@ -1901,74 +1498,7 @@ function handleModelSearchInput(event: Event) {
   requestInputRender();
 }
 
-function handleExtensionUiValueInput(event: Event) {
-  const target = event.target;
-  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
-    state.extensionUiValue = target.value;
-  }
-}
 
-function clearMessageActionContextCache() {
-  cachedMessageActionContextSource = undefined;
-  cachedMessageActionContexts = emptyMessageActionContexts;
-}
-
-function isUserPromptMessage(
-  message: ApiSessionSnapshot["messages"][number] | undefined,
-): message is UserPromptMessage {
-  return message?.role === "user" || message?.role === "user-with-attachments";
-}
-
-function isOptimisticMessageId(messageId: string) {
-  return messageId.startsWith("optimistic-user-");
-}
-
-function buildMessageActionContexts(messages: ApiSessionSnapshot["messages"]) {
-  const contexts = new Map<string, MessageActionContext>();
-  let latestPrompt: ApiSessionSnapshot["messages"][number] | undefined;
-  let promptOrdinal = -1;
-
-  for (const message of messages) {
-    if (isOptimisticMessageId(message.id)) {
-      continue;
-    }
-
-    if (isUserPromptMessage(message)) {
-      latestPrompt = message;
-      promptOrdinal += 1;
-      contexts.set(message.id, {
-        promptMessage: message,
-        promptOrdinal,
-        selectedMessage: message,
-        usesNearestPrompt: false,
-      });
-      continue;
-    }
-
-    if (!latestPrompt) {
-      continue;
-    }
-
-    contexts.set(message.id, {
-      promptMessage: latestPrompt,
-      promptOrdinal,
-      selectedMessage: message,
-      usesNearestPrompt: latestPrompt.id !== message.id,
-    });
-  }
-
-  return contexts;
-}
-
-function getMessageActionContexts(messages: ApiSessionSnapshot["messages"]) {
-  if (cachedMessageActionContextSource === messages) {
-    return cachedMessageActionContexts;
-  }
-
-  cachedMessageActionContextSource = messages;
-  cachedMessageActionContexts = buildMessageActionContexts(messages);
-  return cachedMessageActionContexts;
-}
 
 function applySlashCommandSelection(command: ApiSlashCommand) {
   state.composerText = `/${command.name} `;
@@ -2359,16 +1889,6 @@ function getActiveSessionListItem() {
   );
 }
 
-function updateNewProjectPath(event: Event) {
-  const target = event.target;
-  if (!(target instanceof HTMLInputElement)) {
-    return;
-  }
-  state.newProjectPath = target.value;
-  state.newProjectError = undefined;
-  requestRender();
-}
-
 function getSessionDirectoryOverride(session: Pick<ApiSessionSnapshot, "sessionId" | "sessionFile">) {
   return sessionDirectoryOverrides.get(session.sessionId)
     ?? (session.sessionFile ? sessionDirectoryOverrides.get(session.sessionFile) : undefined);
@@ -2381,878 +1901,7 @@ function setSessionDirectoryOverride(session: Pick<ApiSessionSnapshot, "sessionI
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
 
-function formatStructuredText(text: string) {
-  const trimmed = text.trim();
-  if (!trimmed) return "";
-
-  const looksLikeJson =
-    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-    (trimmed.startsWith("[") && trimmed.endsWith("]"));
-
-  if (!looksLikeJson) return text;
-
-  try {
-    return JSON.stringify(JSON.parse(trimmed), null, 2);
-  } catch {
-    return text;
-  }
-}
-
-function tryParseJson(text: string) {
-  const trimmed = text.trim();
-  if (!trimmed) return undefined;
-
-  const looksLikeJson =
-    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-    (trimmed.startsWith("[") && trimmed.endsWith("]"));
-
-  if (!looksLikeJson) return undefined;
-
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    return undefined;
-  }
-}
-
-function escapeHtml(text: string) {
-  return text
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
-}
-
-function extractFenceLanguage(rawLanguage: string | undefined) {
-  return rawLanguage?.trim().match(/^[^\s{]+/)?.[0]?.toLowerCase();
-}
-
-function getCodeLanguageInfo(rawLanguage: string | undefined) {
-  const fenceLanguage = extractFenceLanguage(rawLanguage);
-  if (!fenceLanguage) {
-    return {
-      displayLanguage: "Text",
-      languageClass: "language-plaintext",
-      normalizedLanguage: undefined,
-      isDiff: false,
-    };
-  }
-
-  const normalizedLanguage = HIGHLIGHT_LANGUAGE_ALIASES[fenceLanguage]
-    ?? (hljs.getLanguage(fenceLanguage) ? fenceLanguage : undefined);
-  const displayLanguage = normalizedLanguage
-    ? (CODE_LANGUAGE_LABELS[normalizedLanguage] ?? fenceLanguage)
-    : fenceLanguage;
-  const classLanguage = normalizedLanguage ?? fenceLanguage;
-
-  return {
-    displayLanguage,
-    languageClass: `language-${classLanguage.replace(/[^a-z0-9_-]+/g, "-")}`,
-    normalizedLanguage,
-    isDiff: normalizedLanguage === "diff",
-  };
-}
-
-function createCodeBlockCopyId(text: string) {
-  const baseId = `code-block-${hashText(text)}`;
-  let copyId = baseId;
-  let collisionIndex = 1;
-
-  while (true) {
-    const cachedText = getBoundedTextCacheValue(codeBlockCopyCache, copyId);
-    if (cachedText === undefined || cachedText === text) {
-      setBoundedTextCacheValue(codeBlockCopyCache, copyId, text);
-      return copyId;
-    }
-
-    copyId = `${baseId}-${collisionIndex}`;
-    collisionIndex += 1;
-  }
-}
-
-function highlightCodeBlockText(text: string, language: string | undefined) {
-  if (!language) {
-    return escapeHtml(text);
-  }
-
-  try {
-    return hljs.highlight(text, { language, ignoreIllegals: true }).value;
-  } catch {
-    return escapeHtml(text);
-  }
-}
-
-function getDiffLineClassName(line: string) {
-  if (
-    line.startsWith("diff ")
-    || line.startsWith("index ")
-    || line.startsWith("+++ ")
-    || line.startsWith("--- ")
-    || line.startsWith("\\")
-  ) {
-    return "pp-code-line pp-diff-line pp-diff-line-meta";
-  }
-  if (line.startsWith("@@")) {
-    return "pp-code-line pp-diff-line pp-diff-line-hunk";
-  }
-  if (line.startsWith("+")) {
-    return "pp-code-line pp-diff-line pp-diff-line-add";
-  }
-  if (line.startsWith("-")) {
-    return "pp-code-line pp-diff-line pp-diff-line-remove";
-  }
-  return "pp-code-line pp-diff-line pp-diff-line-context";
-}
-
-function renderDiffCodeHtml(text: string) {
-  return text
-    .split("\n")
-    .map((line) => {
-      const content = line.length > 0 ? escapeHtml(line) : "&#8203;";
-      return `<span class="${getDiffLineClassName(line)}">${content}</span>`;
-    })
-    .join("");
-}
-
-function renderMarkdownCodeBlock(text: string, rawLanguage: string | undefined) {
-  const { displayLanguage, languageClass, normalizedLanguage, isDiff } = getCodeLanguageInfo(rawLanguage);
-  const copyId = createCodeBlockCopyId(text);
-  const codeHtml = isDiff ? renderDiffCodeHtml(text) : highlightCodeBlockText(text, normalizedLanguage);
-
-  return `<div class="pp-code-block pp-structured-block${isDiff ? " pp-code-block-diff" : ""}">
-  <div class="pp-code-header">
-    <span class="pp-code-language">${escapeHtml(displayLanguage)}</span>
-    <button type="button" class="pp-copy-btn" data-copy-id="${copyId}">Copy</button>
-  </div>
-  <pre class="pp-code-surface"><code class="hljs ${languageClass}">${codeHtml}</code></pre>
-</div>`;
-}
-
-function highlightJson(prettyJson: string) {
-  const escaped = escapeHtml(prettyJson);
-  return escaped.replace(
-    /("(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\btrue\b|\bfalse\b|\bnull\b|-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)/g,
-    (match) => {
-      let className = "pp-json-number";
-      if (match.startsWith("\"")) {
-        className = match.endsWith(":") ? "pp-json-key" : "pp-json-string";
-      } else if (match === "true" || match === "false") {
-        className = "pp-json-boolean";
-      } else if (match === "null") {
-        className = "pp-json-null";
-      }
-
-      return `<span class="${className}">${match}</span>`;
-    },
-  );
-}
-
-function renderStructuredBlock(text: string) {
-  const formatted = formatStructuredText(text).trim();
-  const parsed = tryParseJson(formatted);
-
-  if (parsed !== undefined) {
-    const prettyJson = JSON.stringify(parsed, null, 2) ?? "";
-    return html`<pre class="pp-content-block pp-structured-block pp-json-view">${unsafeHTML(highlightJson(prettyJson))}</pre>`;
-  }
-
-  return html`<pre class="pp-content-block pp-structured-block pp-tool-text">${formatted}</pre>`;
-}
-
-type ToolCallArgumentKind = "command" | "path" | "query" | "prompt" | "message" | "url";
-
-function humanizeToolArgumentKey(key: string) {
-  const normalized = key
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!normalized) return key;
-  return normalized.replace(/\b\w/g, (match) => match.toUpperCase());
-}
-
-function getToolCallArgumentKind(key: string): ToolCallArgumentKind | undefined {
-  const normalized = key.trim().toLowerCase();
-  if (!normalized) return undefined;
-  if (normalized === "command" || normalized.endsWith("command")) return "command";
-  if (normalized === "path" || normalized.endsWith("path")) return "path";
-  if (normalized === "query" || normalized.endsWith("query")) return "query";
-  if (normalized === "prompt" || normalized.endsWith("prompt")) return "prompt";
-  if (normalized === "message" || normalized.endsWith("message")) return "message";
-  if (normalized === "url" || normalized.endsWith("url")) return "url";
-  return undefined;
-}
-
-function getToolCallArgumentPriority(kind: ToolCallArgumentKind) {
-  switch (kind) {
-    case "command":
-      return 0;
-    case "path":
-      return 1;
-    case "query":
-      return 2;
-    case "prompt":
-      return 3;
-    case "message":
-      return 4;
-    case "url":
-      return 5;
-    default:
-      return Number.MAX_SAFE_INTEGER;
-  }
-}
-
-function renderCopyableCodeBlock(options: {
-  label: string;
-  text: string;
-  language?: string;
-  className?: string;
-}) {
-  const { displayLanguage, languageClass, normalizedLanguage } = getCodeLanguageInfo(options.language);
-  const copyId = createCodeBlockCopyId(options.text);
-  const codeHtml = normalizedLanguage === "json"
-    ? highlightJson(options.text)
-    : highlightCodeBlockText(options.text, normalizedLanguage);
-  const className = ["pp-code-block", "pp-structured-block", options.className].filter(Boolean).join(" ");
-  const headerLabel = options.label || displayLanguage;
-
-  return html`
-    <div class=${className}>
-      <div class="pp-code-header">
-        <span class="pp-code-language">${headerLabel}</span>
-        <button type="button" class="pp-copy-btn" data-copy-id=${copyId}>Copy</button>
-      </div>
-      <pre class="pp-code-surface">
-        <code class="hljs ${languageClass}">${unsafeHTML(codeHtml)}</code>
-      </pre>
-    </div>
-  `;
-}
-
-function formatToolCallMetadataValue(value: unknown) {
-  if (typeof value === "string") return value;
-  if (typeof value === "number" || typeof value === "boolean" || value === null) return String(value);
-  return undefined;
-}
-
-function stringifyStructuredValue(value: unknown) {
-  if (typeof value === "string") return value;
-  if (value === undefined) return "";
-
-  try {
-    return JSON.stringify(value, null, 2) ?? String(value);
-  } catch {
-    return String(value);
-  }
-}
-
-function renderToolCallArguments(argsValue: unknown) {
-  const trimmed = stringifyStructuredValue(argsValue).trim();
-  if (!trimmed) {
-    return html`<span class="pp-tool-inline-note">No arguments</span>`;
-  }
-
-  const parsed = typeof argsValue === "string"
-    ? tryParseJson(trimmed)
-    : argsValue;
-  if (!isRecord(parsed) || Array.isArray(parsed)) {
-    return renderStructuredBlock(trimmed);
-  }
-
-  const entries = Object.entries(parsed);
-  const featuredEntries = entries
-    .map(([key, value], index) => {
-      if (typeof value !== "string" || !value.trim()) return undefined;
-      const kind = getToolCallArgumentKind(key);
-      if (!kind) return undefined;
-
-      return {
-        index,
-        key,
-        label: humanizeToolArgumentKey(key),
-        kind,
-        value,
-      };
-    })
-    .filter((entry): entry is {
-      index: number;
-      key: string;
-      label: string;
-      kind: ToolCallArgumentKind;
-      value: string;
-    } => Boolean(entry))
-    .sort((left, right) =>
-      getToolCallArgumentPriority(left.kind) - getToolCallArgumentPriority(right.kind)
-      || left.index - right.index
-    );
-
-  if (featuredEntries.length === 0) {
-    return renderStructuredBlock(trimmed);
-  }
-
-  const featuredKeys = new Set(featuredEntries.map((entry) => entry.key));
-  const metadataEntries = entries
-    .map(([key, value]) => {
-      if (featuredKeys.has(key)) return undefined;
-      const formattedValue = formatToolCallMetadataValue(value);
-      if (formattedValue === undefined) return undefined;
-
-      return {
-        key,
-        label: humanizeToolArgumentKey(key),
-        value: formattedValue,
-      };
-    })
-    .filter((entry): entry is { key: string; label: string; value: string } => Boolean(entry));
-
-  const rawJson = JSON.stringify(parsed, null, 2) ?? trimmed;
-
-  return html`
-    <div class="pp-tool-args">
-      ${featuredEntries.map((entry) => renderCopyableCodeBlock({
-        label: entry.label,
-        text: entry.value,
-        language: entry.kind === "command" ? "bash" : "plaintext",
-        className: "pp-tool-arg-block",
-      }))}
-      ${metadataEntries.length > 0
-        ? html`
-            <div class="pp-tool-arg-meta">
-              ${metadataEntries.map((entry) => html`
-                <div class="pp-tool-arg-meta-item">
-                  <span class="pp-tool-arg-meta-key">${entry.label}</span>
-                  <code class="pp-tool-arg-meta-value">${entry.value}</code>
-                </div>
-              `)}
-            </div>
-          `
-        : nothing}
-      <details class="pp-tool-arg-raw">
-        <summary class="pp-tool-arg-raw-summary">Raw JSON</summary>
-        <div class="pp-tool-arg-raw-body">
-          ${renderCopyableCodeBlock({
-            label: "Raw JSON",
-            text: rawJson,
-            language: "json",
-            className: "pp-tool-arg-block",
-          })}
-        </div>
-      </details>
-    </div>
-  `;
-}
-
-function getToolCardKey(...parts: string[]) {
-  return [state.activeSession?.sessionId ?? "no-session", ...parts].join(":");
-}
-
-function handleToolCardToggle(cardKey: string, event: Event) {
-  const details = event.currentTarget;
-  if (!(details instanceof HTMLDetailsElement)) return;
-
-  if (details.open) state.expandedToolCards.add(cardKey);
-  else state.expandedToolCards.delete(cardKey);
-
-  requestRender();
-}
-
-function summarizeToolCallPreview(argsValue: unknown) {
-  const trimmed = stringifyStructuredValue(argsValue).trim();
-  if (!trimmed) return undefined;
-
-  const parsed = typeof argsValue === "string"
-    ? tryParseJson(trimmed)
-    : argsValue;
-  if (isRecord(parsed) && !Array.isArray(parsed)) {
-    const preferredPreviewKeys = ["command", "path", "prompt", "message", "query"];
-    for (const key of preferredPreviewKeys) {
-      const value = parsed[key];
-      if (typeof value === "string" && value.trim()) {
-        return truncate(value, 60);
-      }
-    }
-  }
-
-  return truncate(trimmed.replace(/\s+/g, " "), 60);
-}
-
-function summarizeToolExecutionPreview(text: string) {
-  const formatted = formatStructuredText(text)
-    .replace(/\r\n/g, "\n")
-    .trim();
-  if (!formatted) return undefined;
-  const firstMeaningfulLine = formatted
-    .split("\n")
-    .map((line) => line.trim())
-    .find(Boolean);
-  return firstMeaningfulLine ? truncate(firstMeaningfulLine, 80) : undefined;
-}
-
-function isToolFailureText(text: string) {
-  const formatted = formatStructuredText(text)
-    .replace(/\r\n/g, "\n")
-    .trim();
-  if (!formatted) return false;
-
-  const firstMeaningfulLine = formatted
-    .split("\n")
-    .map((line) => line.trim())
-    .find(Boolean) ?? formatted;
-
-  if (/^error[:\s]/i.test(firstMeaningfulLine)) return true;
-
-  return /\b(command not found|no such file or directory|not recognized as an internal or external command|permission denied|timed out|timeout|exception|traceback|failed|failure|ENOENT|EACCES|ECONNREFUSED|syntax error)\b/i
-    .test(formatted);
-}
-
-function getToolResultState(
-  resultMessage: ToolResultMessage,
-  fallbackStatus: Extract<ToolActivityState, "done" | "error"> | undefined = undefined,
-): Extract<ToolActivityState, "done" | "error"> {
-  if (typeof resultMessage.isError === "boolean") {
-    return resultMessage.isError ? "error" : "done";
-  }
-
-  if (fallbackStatus) {
-    return fallbackStatus;
-  }
-
-  return isToolFailureText(resultMessage.text) ? "error" : "done";
-}
-
-function getToolActivityPreview(options: {
-  toolCallPreview: string | undefined;
-  resultMessages: ToolResultMessage[];
-  toolExecution: ApiSessionSnapshot["toolExecutions"][number] | undefined;
-  status: ToolActivityState;
-}) {
-  const resultPreview = [...options.resultMessages]
-    .reverse()
-    .map((resultMessage) => summarizeToolExecutionPreview(resultMessage.text))
-    .find(Boolean);
-  const executionPreview = summarizeToolExecutionPreview(options.toolExecution?.text ?? "");
-  const outputPreview = resultPreview ?? executionPreview;
-
-  if ((options.status === "running" || options.status === "done" || options.status === "error") && outputPreview) {
-    return outputPreview;
-  }
-
-  return options.toolCallPreview ?? outputPreview;
-}
-
-function takeMatchingToolExecution(
-  toolExecutions: ApiSessionSnapshot["toolExecutions"],
-  toolCall: ParsedToolCallMessage,
-  consumedToolExecutionIds: Set<string>,
-) {
-  if (toolCall.toolCallId) {
-    const exactMatch = toolExecutions.find((toolExecution) =>
-      toolExecution.toolCallId === toolCall.toolCallId && !consumedToolExecutionIds.has(toolExecution.toolCallId)
-    );
-    if (exactMatch) return exactMatch;
-  }
-
-  return toolExecutions.find((toolExecution) =>
-    toolExecution.toolName === toolCall.toolName && !consumedToolExecutionIds.has(toolExecution.toolCallId)
-  );
-}
-
-function getToolActivityState(
-  toolExecution: ApiSessionSnapshot["toolExecutions"][number] | undefined,
-  resultMessages: ToolResultMessage[],
-): ToolActivityState {
-  if (resultMessages.length > 0) {
-    const explicitStatuses = resultMessages
-      .filter((resultMessage) => typeof resultMessage.isError === "boolean")
-      .map((resultMessage) => resultMessage.isError ? "error" : "done");
-
-    if (explicitStatuses.length > 0) {
-      return explicitStatuses.includes("error") ? "error" : "done";
-    }
-
-    if (toolExecution?.status === "error" || toolExecution?.status === "done") {
-      return toolExecution.status;
-    }
-
-    return resultMessages.some((resultMessage) => isToolFailureText(resultMessage.text)) ? "error" : "done";
-  }
-
-  if (toolExecution?.status === "error") return "error";
-  if (toolExecution?.status === "running") return "running";
-  if (toolExecution?.status === "done") return "done";
-  return "call";
-}
-
-function getToolActivityStatusLabel(status: ToolActivityState) {
-  switch (status) {
-    case "running":
-      return "Running";
-    case "done":
-      return "Done";
-    case "error":
-      return "Failed";
-    default:
-      return "Call";
-  }
-}
-
-function renderToolActivityCard(options: {
-  cardKey: string;
-  title: string;
-  preview: string | undefined;
-  status: ToolActivityState;
-  detail: ReturnType<typeof html>;
-  variant: "inline" | "live" | "result";
-  secondaryLabel: string | undefined;
-}) {
-  const isExpanded = options.status === "error" || state.expandedToolCards.has(options.cardKey);
-  return html`
-    <details
-      class="pp-tool-card pp-tool-card-${options.variant} pp-tool-card-${options.status} pp-content-block"
-      ?open=${isExpanded}
-      @toggle=${(event: Event) => handleToolCardToggle(options.cardKey, event)}
-    >
-      <summary class="pp-tool-summary">
-        <span class="pp-tool-summary-main">
-          <span class="pp-tool-dot ${options.status}" aria-hidden="true"></span>
-          <span class="pp-tool-summary-copy">
-            <span class="pp-tool-name">${options.title}</span>
-            ${options.preview ? html`<span class="pp-tool-preview">${options.preview}</span>` : nothing}
-          </span>
-        </span>
-        <span class="pp-tool-meta">
-          ${options.secondaryLabel ? html`<span class="pp-tool-chip">${options.secondaryLabel}</span>` : nothing}
-          <span class="pp-tool-status ${options.status}">${getToolActivityStatusLabel(options.status)}</span>
-          <span class="pp-tool-disclosure">${isExpanded ? "Hide" : "Details"}</span>
-        </span>
-      </summary>
-      ${isExpanded ? html`<div class="pp-tool-content">${options.detail}</div>` : nothing}
-    </details>
-  `;
-}
-
-function parseAssistantMessageParts(text: string): AssistantMessagePart[] {
-  const cached = getLruCacheValue(assistantMessagePartsCache, text);
-  if (cached) return cached;
-
-  const normalized = text.replace(/\r\n/g, "\n");
-  const lines = normalized.split("\n");
-  const parts: AssistantMessagePart[] = [];
-  let markdownBuffer: string[] = [];
-  let index = 0;
-
-  const flushMarkdown = () => {
-    const markdown = markdownBuffer.join("\n").trim();
-    markdownBuffer = [];
-    if (markdown) parts.push({ type: "markdown", text: markdown });
-  };
-
-  while (index < lines.length) {
-    const thinkingBlock = consumeThinkingBlock(lines, index);
-    if (thinkingBlock) {
-      flushMarkdown();
-      if (thinkingBlock.message.text) {
-        parts.push(thinkingBlock.message);
-      }
-      index = thinkingBlock.nextIndex;
-      continue;
-    }
-
-    const toolCall = consumeToolCall(lines, index);
-    if (!toolCall) {
-      markdownBuffer.push(lines[index] ?? "");
-      index += 1;
-      continue;
-    }
-
-    flushMarkdown();
-    parts.push({ type: "toolCall", toolCall: toolCall.message });
-    index = toolCall.nextIndex;
-  }
-
-  flushMarkdown();
-  const resolvedParts: AssistantMessagePart[] = parts.length ? parts : [{ type: "markdown", text }];
-  setLruCacheValue(assistantMessagePartsCache, text, resolvedParts, ASSISTANT_MESSAGE_PARTS_CACHE_LIMIT);
-  return resolvedParts;
-}
-
-function consumeThinkingBlock(lines: string[], startIndex: number) {
-  if (lines[startIndex]?.trim() !== THINKING_START_MARKER) return undefined;
-
-  let endIndex = startIndex + 1;
-  while (endIndex < lines.length && lines[endIndex]?.trim() !== THINKING_END_MARKER) {
-    endIndex += 1;
-  }
-
-  if (endIndex >= lines.length) return undefined;
-
-  return {
-    message: {
-      type: "thinking" as const,
-      text: lines.slice(startIndex + 1, endIndex).join("\n").trim(),
-    },
-    nextIndex: endIndex + 1,
-  };
-}
-
-const toolCallHeaderPattern = /^\[tool call:\s*([^;\]]+?)(?:;\s*id=([^\]]+))?\]$/;
-
-function parseToolCallHeader(line: string | undefined) {
-  const match = line?.trim().match(toolCallHeaderPattern);
-  if (!match) return undefined;
-
-  const toolName = match[1]?.trim();
-  if (!toolName) return undefined;
-
-  const toolCallId = match[2]?.trim() || undefined;
-  return { toolName, toolCallId };
-}
-
-function isToolCallHeaderLine(line: string | undefined) {
-  return Boolean(parseToolCallHeader(line));
-}
-
-function consumeToolCall(lines: string[], startIndex: number) {
-  const header = parseToolCallHeader(lines[startIndex]);
-  if (!header) return undefined;
-
-  let index = startIndex + 1;
-  while (index < lines.length && lines[index]?.trim() === "") index += 1;
-
-  if (index >= lines.length) {
-    return {
-      message: { toolName: header.toolName, toolCallId: header.toolCallId, arguments: "", preview: undefined },
-      nextIndex: index,
-    };
-  }
-
-  const jsonLines: string[] = [];
-  for (let end = index; end < lines.length; end += 1) {
-    if (isToolCallHeaderLine(lines[end])) break;
-
-    jsonLines.push(lines[end] ?? "");
-    const candidate = jsonLines.join("\n").trim();
-    if (!candidate) continue;
-
-    if (
-      ((candidate.startsWith("{") && candidate.endsWith("}")) ||
-        (candidate.startsWith("[") && candidate.endsWith("]")))
-    ) {
-      try {
-        const parsedArguments = JSON.parse(candidate);
-        return {
-          message: {
-            toolName: header.toolName,
-            toolCallId: header.toolCallId,
-            arguments: parsedArguments,
-            preview: summarizeToolCallPreview(parsedArguments),
-          },
-          nextIndex: end + 1,
-        };
-      } catch {
-        // Keep accumulating until the JSON block is complete.
-      }
-    }
-  }
-
-  let endIndex = index;
-  while (endIndex < lines.length && !isToolCallHeaderLine(lines[endIndex])) {
-    endIndex += 1;
-  }
-
-  const rawArguments = lines.slice(index, endIndex).join("\n").trim();
-  return {
-    message: {
-      toolName: header.toolName,
-      toolCallId: header.toolCallId,
-      arguments: rawArguments,
-      preview: summarizeToolCallPreview(rawArguments),
-    },
-    nextIndex: endIndex,
-  };
-}
-
-function getAssistantMessageParts(message: ApiSessionSnapshot["messages"][number]) {
-  if (Array.isArray(message.parts) && message.parts.length > 0) {
-    const structuredParts = message.parts
-      .flatMap((part): AssistantMessagePart[] => {
-        if (part.type === "text") {
-          return part.text.trim() ? [{ type: "markdown", text: part.text }] : [];
-        }
-
-        if (part.type === "thinking") {
-          return part.text.trim() ? [{ type: "thinking", text: part.text }] : [];
-        }
-
-        if (part.type === "toolCall") {
-          return [{
-            type: "toolCall",
-            toolCall: {
-              toolName: part.toolName,
-              toolCallId: part.toolCallId,
-              arguments: part.arguments,
-              preview: summarizeToolCallPreview(part.arguments),
-            },
-          }];
-        }
-
-        return [];
-      });
-
-    if (structuredParts.length > 0) {
-      return structuredParts;
-    }
-  }
-
-  return parseAssistantMessageParts(message.text);
-}
-
-function renderToolCallMessage(
-  toolCall: ParsedToolCallMessage,
-  cardKey: string,
-  resultMessages: ToolResultMessage[] = [],
-  toolExecution: ApiSessionSnapshot["toolExecutions"][number] | undefined = undefined,
-) {
-  const status = getToolActivityState(toolExecution, resultMessages);
-  const preview = getToolActivityPreview({
-    toolCallPreview: toolCall.preview,
-    resultMessages,
-    toolExecution,
-    status,
-  });
-  const secondaryLabel = resultMessages.length > 0
-    ? resultMessages.length === 1
-      ? "1 result"
-      : `${resultMessages.length} results`
-    : status === "running"
-      ? "live"
-      : undefined;
-  const resultFallbackStatus = toolExecution?.status === "error" || toolExecution?.status === "done"
-    ? toolExecution.status
-    : undefined;
-
-  return renderToolActivityCard({
-    cardKey,
-    title: toolCall.toolName,
-    preview,
-    status,
-    variant: "inline",
-    secondaryLabel,
-    detail: html`
-      <div class="pp-tool-section">
-        <div class="pp-tool-section-label">Call</div>
-        <div class="pp-tool-section-body">${renderToolCallArguments(toolCall.arguments)}</div>
-      </div>
-      ${resultMessages.length > 0
-        ? resultMessages.map((resultMessage, index) =>
-            renderToolResultSection(resultMessage, index, resultMessages.length, resultFallbackStatus)
-          )
-        : toolExecution?.text
-          ? html`
-              <div class="pp-tool-section pp-tool-section-result">
-                <div class="pp-tool-section-label">${status === "error" ? "Error" : "Live output"}</div>
-                <div class="pp-tool-section-body">${renderStructuredBlock(toolExecution.text)}</div>
-              </div>
-            `
-          : status === "running"
-            ? html`
-                <div class="pp-tool-section pp-tool-section-result">
-                  <div class="pp-tool-section-label">Status</div>
-                  <div class="pp-tool-section-body"><span class="pp-tool-inline-note">Running…</span></div>
-                </div>
-              `
-            : nothing}
-    `,
-  });
-}
-
-function renderToolResultSection(
-  resultMessage: ToolResultMessage,
-  index: number,
-  total: number,
-  fallbackStatus: Extract<ToolActivityState, "done" | "error"> | undefined = undefined,
-) {
-  const label = getToolResultState(resultMessage, fallbackStatus) === "error"
-    ? total === 1
-      ? "Error"
-      : `Error ${index + 1}`
-    : total === 1
-      ? "Result"
-      : `Result ${index + 1}`;
-  return html`
-    <div class="pp-tool-section pp-tool-section-result">
-      <div class="pp-tool-section-label">${label}</div>
-      <div class="pp-tool-section-body">${renderStructuredBlock(resultMessage.text)}</div>
-    </div>
-  `;
-}
-
-function renderMarkdown(text: string): ReturnType<typeof html> {
-  const raw = getBoundedTextCacheValue(markdownHtmlCache, text) ?? (() => {
-    const rendered = marked.parse(text, { async: false }) as string;
-    setBoundedTextCacheValue(markdownHtmlCache, text, rendered);
-    return rendered;
-  })();
-  return html`<div class="pp-content-block pp-markdown">${unsafeHTML(raw)}</div>`;
-}
-
-function renderThinking(text: string) {
-  return html`
-    <div class="pp-thinking">
-      <div class="pp-thinking-label">Thinking</div>
-      <div class="pp-thinking-content">${text}</div>
-    </div>
-  `;
-}
-
-function showCopyButtonState(button: HTMLButtonElement, label: string) {
-  const previousLabel = button.textContent ?? "Copy";
-  button.textContent = label;
-  setTimeout(() => {
-    button.textContent = previousLabel;
-  }, 1500);
-}
-
-async function writeTextWithFallback(text: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
-    const textarea = document.createElement("textarea");
-    textarea.value = text;
-    textarea.setAttribute("readonly", "");
-    textarea.style.position = "fixed";
-    textarea.style.top = "0";
-    textarea.style.left = "0";
-    textarea.style.opacity = "0";
-    document.body.append(textarea);
-    textarea.select();
-    textarea.setSelectionRange(0, text.length);
-
-    try {
-      return document.execCommand("copy");
-    } finally {
-      textarea.remove();
-    }
-  }
-}
-
-function copyToClipboard(text: string, button: HTMLButtonElement) {
-  void writeTextWithFallback(text).then((copied) => {
-    showCopyButtonState(button, copied ? "Copied!" : "Failed");
-  });
-}
-
-function copyMessageText(messageText: string, button: HTMLButtonElement) {
-  if (!messageText.trim()) {
-    showCopyButtonState(button, "Empty");
-    return;
-  }
-  copyToClipboard(messageText, button);
-}
 
 async function getMessageActionTargetFromContext(context: MessageActionContext) {
   const activeSession = state.activeSession;
@@ -3289,9 +1938,8 @@ function handleMessageCopy(messageText: string, event: Event) {
   copyMessageText(messageText, button);
 }
 
-async function handleMessageEdit(messageId: string) {
+async function handleMessageEdit(context: MessageActionContext | undefined) {
   try {
-    const context = state.activeSession ? getMessageActionContexts(state.activeSession.messages).get(messageId) : undefined;
     const target = context ? await getMessageActionTargetFromContext(context) : undefined;
     if (!target) {
       state.error = "No earlier prompt is available to edit yet.";
@@ -3312,9 +1960,8 @@ async function handleMessageEdit(messageId: string) {
   }
 }
 
-async function handleMessageForkFromHere(messageId: string) {
+async function handleMessageForkFromHere(context: MessageActionContext | undefined) {
   try {
-    const context = state.activeSession ? getMessageActionContexts(state.activeSession.messages).get(messageId) : undefined;
     const target = context ? await getMessageActionTargetFromContext(context) : undefined;
     if (!target) {
       state.error = "No earlier prompt is available to fork from yet.";
@@ -3335,9 +1982,8 @@ async function handleMessageForkFromHere(messageId: string) {
   }
 }
 
-async function handleMessageRetry(messageId: string) {
+async function handleMessageRetry(context: MessageActionContext | undefined) {
   try {
-    const context = state.activeSession ? getMessageActionContexts(state.activeSession.messages).get(messageId) : undefined;
     const target = context ? await getMessageActionTargetFromContext(context) : undefined;
     if (!target) {
       state.error = "No earlier prompt is available to retry yet.";
@@ -3376,18 +2022,7 @@ async function handleMessageRetry(messageId: string) {
 }
 
 function handleAppClick(event: Event) {
-  const target = event.target;
-  if (!(target instanceof Element)) return;
-
-  const copyButton = target.closest<HTMLButtonElement>(".pp-copy-btn[data-copy-id]");
-  const copyId = copyButton?.dataset.copyId;
-  if (!copyButton || !copyId) return;
-
-  const text = getBoundedTextCacheValue(codeBlockCopyCache, copyId);
-  if (text === undefined) return;
-
-  event.preventDefault();
-  copyToClipboard(text, copyButton);
+  handleCodeCopyClick(event);
 }
 
 function setupAppInteractions() {
@@ -3427,6 +2062,7 @@ async function handleSessionClick(session: ApiSessionListItem) {
   }
   requestRender();
   await waitForNextPaint();
+  await delay(SESSION_SWITCH_FEEDBACK_MS);
 
   try {
     if (session.live) {
@@ -3511,7 +2147,7 @@ function renderMessageActions(
         type="button"
         ?disabled=${!canReplayPrompt}
         title=${replayTitle}
-        @click=${() => void handleMessageRetry(message.id)}
+        @click=${() => void handleMessageRetry(messageActionContext)}
         aria-label="Retry from here"
       >Retry</button>
       <button
@@ -3519,7 +2155,7 @@ function renderMessageActions(
         type="button"
         ?disabled=${!canReplayPrompt}
         title=${replayTitle}
-        @click=${() => void handleMessageEdit(message.id)}
+        @click=${() => void handleMessageEdit(messageActionContext)}
         aria-label="Edit prompt from here"
       >Edit</button>
       <button
@@ -3527,113 +2163,44 @@ function renderMessageActions(
         type="button"
         ?disabled=${!canReplayPrompt}
         title=${replayTitle}
-        @click=${() => void handleMessageForkFromHere(message.id)}
+        @click=${() => void handleMessageForkFromHere(messageActionContext)}
         aria-label="Fork from here"
       >Fork</button>
     </div>
   `;
 }
 
-function renderMessageRow(
-  kind: "user" | "assistant" | "extension",
-  content: ReturnType<typeof html>,
-  actions?: ReturnType<typeof html>,
-) {
-  return html`
-    <div class="pp-message-row pp-message-row-${kind}" data-message-kind=${kind}>
-      <div class="pp-message-shell pp-message-shell-${kind}">
-        <div class="pp-message-surface pp-message-surface-${kind}">${content}</div>
-        ${actions ?? nothing}
-      </div>
-    </div>
-  `;
+
+function handleToolCardToggle(cardKey: string, event: Event) {
+  const details = event.currentTarget;
+  if (details instanceof HTMLDetailsElement) {
+    if (details.open) {
+      state.expandedToolCards.add(cardKey);
+    } else {
+      state.expandedToolCards.delete(cardKey);
+    }
+    requestRender();
+  }
 }
 
-function renderConversation(
-  messages: ApiSessionSnapshot["messages"],
-  toolExecutions: ApiSessionSnapshot["toolExecutions"] = [],
-): ConversationRenderResult {
-  const grouped: ReturnType<typeof html>[] = [];
-  const consumedToolExecutionIds = new Set<string>();
-  const messageActionContexts = getMessageActionContexts(messages);
-
-  for (let index = 0; index < messages.length; index += 1) {
-    const message = messages[index];
-    if (!message) continue;
-
-    if (message.role === "assistant") {
-      const parts = getAssistantMessageParts(message);
-      const toolCallParts = parts.filter((part): part is Extract<AssistantMessagePart, { type: "toolCall" }> =>
-        part.type === "toolCall"
-      );
-      const groupedToolResults: ToolResultMessage[][] = [];
-      const toolExecutionMatches: Array<ApiSessionSnapshot["toolExecutions"][number] | undefined> = [];
-
-      if (toolCallParts.length > 0) {
-        const trailingToolResults: ToolResultMessage[] = [];
-        let nextIndex = index + 1;
-
-        while (messages[nextIndex]?.role === "toolResult") {
-          trailingToolResults.push(messages[nextIndex]!);
-          nextIndex += 1;
-        }
-
-        for (let toolCallIndex = 0; toolCallIndex < toolCallParts.length; toolCallIndex += 1) {
-          const toolCall = toolCallParts[toolCallIndex]!.toolCall;
-          const assignedResults = toolCall.toolCallId
-            ? trailingToolResults.filter((result) => result.toolCallId === toolCall.toolCallId)
-            : [];
-
-          if (assignedResults.length > 0) {
-            for (const result of assignedResults) {
-              const resultIndex = trailingToolResults.indexOf(result);
-              if (resultIndex >= 0) {
-                trailingToolResults.splice(resultIndex, 1);
-              }
-            }
-          } else if (trailingToolResults.length > 0) {
-            assignedResults.push(trailingToolResults.shift()!);
-          }
-
-          if (toolCallIndex === toolCallParts.length - 1 && trailingToolResults.length > 0) {
-            assignedResults.push(...trailingToolResults.splice(0));
-          }
-
-          groupedToolResults.push(assignedResults);
-        }
-
-        if (groupedToolResults.some((results) => results.length > 0)) {
-          index = nextIndex - 1;
-        }
-      }
-
-      for (const part of parts) {
-        if (part.type !== "toolCall") continue;
-        const toolExecution = takeMatchingToolExecution(toolExecutions, part.toolCall, consumedToolExecutionIds);
-        toolExecutionMatches.push(toolExecution);
-        if (toolExecution) consumedToolExecutionIds.add(toolExecution.toolCallId);
-      }
-
-      grouped.push(renderMessage(message, messageActionContexts.get(message.id), groupedToolResults, toolExecutionMatches, parts));
-      continue;
-    }
-
-    grouped.push(renderMessage(message, messageActionContexts.get(message.id)));
-  }
-
+function getConversationRenderingOptions(actionContextMessages: ApiSessionSnapshot["messages"]) {
   return {
-    entries: grouped,
-    remainingToolExecutions: toolExecutions.filter(
-      (toolExecution) => !consumedToolExecutionIds.has(toolExecution.toolCallId),
-    ),
+    sessionId: state.activeSession?.sessionId,
+    actionContextMessages,
+    expandedToolCards: state.expandedToolCards,
+    onToolCardToggle: handleToolCardToggle,
+    renderMessageActions,
   };
 }
+
+
 
 const template = () => {
   const renderedMessages = state.activeSession ? getRenderedMessages(state.activeSession) : [];
   const visibleConversation = getVisibleConversationMessages(renderedMessages);
+  const conversationRendering = getConversationRenderingOptions(renderedMessages);
   const conversation = state.activeSession
-    ? renderConversation(visibleConversation.messages, state.activeSession.toolExecutions)
+    ? renderConversation(visibleConversation.messages, state.activeSession.toolExecutions, conversationRendering)
     : undefined;
   const detachedToolExecutions = conversation?.remainingToolExecutions.filter((tool) => tool.status !== "done") ?? [];
   const activeSessionListItem = getActiveSessionListItem();
@@ -3643,10 +2210,11 @@ const template = () => {
   const workspaceLabel = sessionCwd ? shortenCwd(sessionCwd) : undefined;
   const contextUsageLabel = formatContextUsage(state.activeSession?.contextUsage);
   const runningToolCount = state.activeSession?.toolExecutions.filter((tool) => tool.status === "running").length ?? 0;
+  const activeSessionModelLabel = state.activeSession?.model?.name ?? "No model";
 
   return html`
   <div class="pp-shell pp-shell-${state.displayMode}" data-display-mode=${state.displayMode}>
-    ${renderToasts()}
+    ${extensionUi.renderToasts()}
 
     <!-- Header -->
     <header class="pp-header">
@@ -3654,7 +2222,7 @@ const template = () => {
         <button
           class="pp-header-icon-btn"
           @click=${toggleSidebar}
-          aria-label=${state.sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
+          aria-label=${state.sidebarOpen ? isMobileSidebarLayout() ? "Close sidebar" : "Collapse sidebar" : isMobileSidebarLayout() ? "Expand sidebar" : "Show session list"}
           aria-expanded=${String(state.sidebarOpen)}
         >\u2630</button>
         <span class="pp-header-title">Pi Web</span>
@@ -3666,7 +2234,7 @@ const template = () => {
         >+ NEW</button>
         <button
           class="pp-header-new-btn"
-          @click=${openCreateProjectDialog}
+          @click=${openProjectSessionDialog}
         >PROJECT</button>
         <div class="pp-header-menu-wrap">
           <button
@@ -3683,7 +2251,7 @@ const template = () => {
     <!-- Body -->
     <div class="pp-body ${state.sidebarOpen ? "sidebar-open" : "sidebar-closed"} ${isMobileSidebarLayout() ? "sidebar-overlay" : "sidebar-docked"}">
       ${isMobileSidebarLayout() && state.sidebarOpen
-        ? html`<button class="pp-sidebar-scrim" @click=${closeSidebar} aria-label="Close sidebar"></button>`
+        ? html`<button class="pp-sidebar-scrim" @click=${closeSidebar} aria-label="Dismiss sidebar overlay"></button>`
         : nothing}
       <!-- Sidebar -->
       <aside class="pp-sidebar ${isMobileSidebarLayout() ? "mobile" : "desktop"}" aria-hidden=${String(!state.sidebarOpen)}>
@@ -3701,12 +2269,24 @@ const template = () => {
       </aside>
 
       <!-- Main content -->
-      <div class="pp-main">
+      <main class="pp-main" aria-label="Active conversation">
+        ${state.activeSession
+          ? html`
+              <div class="pp-active-session-header">
+                <div class="pp-active-session-title-block">
+                  <h1>${state.activeSession.title}</h1>
+                  <div class="pp-active-session-meta">
+                    ${state.activeSession.messages.length} msgs · ${activeSessionModelLabel}
+                  </div>
+                </div>
+              </div>
+            `
+          : nothing}
         ${state.activeSession?.externallyDirty ? renderExternalBanner() : nothing}
 
         ${state.error ? html`<div class="pp-error" style="margin:0.75rem 1.5rem 0;">${state.error}</div>` : nothing}
         ${state.info ? html`<div class="pp-info" style="margin:0.75rem 1.5rem 0;">${state.info}</div>` : nothing}
-        ${renderExtensionSurface(state.extensionHeader, "header")}
+        ${extensionUi.renderHeader()}
 
         <div class="pp-messages">
           <div class="pp-messages-inner">
@@ -3728,7 +2308,7 @@ const template = () => {
                 : html`<div class="pp-empty">No messages yet. Start typing below.</div>`}
 
             ${detachedToolExecutions.length
-              ? detachedToolExecutions.map((tool) => renderToolCard(tool))
+              ? detachedToolExecutions.map((tool) => renderToolCard(conversationRendering, tool))
               : nothing}
 
             ${state.activeSession?.status === "streaming"
@@ -3737,7 +2317,7 @@ const template = () => {
           </div>
         </div>
 
-        ${renderExtensionWidgets("aboveEditor")}
+        ${extensionUi.renderWidgets("aboveEditor")}
 
         ${state.activeSession?.status === "streaming"
           ? html`
@@ -3824,10 +2404,10 @@ const template = () => {
           </div>
         </div>
 
-        ${renderExtensionWidgets("belowEditor")}
+        ${extensionUi.renderWidgets("belowEditor")}
 
-        ${state.extensionFooter
-          ? renderExtensionSurface(state.extensionFooter, "footer")
+        ${extensionUi.hasFooter()
+          ? extensionUi.renderFooter()
           : html`
               <!-- Status bar -->
               <div class="pp-statusbar">
@@ -3845,11 +2425,9 @@ const template = () => {
                     : nothing}
                 </div>
                 <div class="pp-statusbar-actions">
-                  ${state.extensionStatuses.map(
-                    (s) => html`<span style="font-size:0.6875rem;">${s.key}: ${renderAnsiText(s.text, "pp-ansi-inline")}</span>`,
-                  )}
+                  ${extensionUi.renderStatuses()}
                   <button class="pp-statusbar-model" @click=${openModelsDialog}>
-                    ${state.activeSession?.model?.name ?? "No model"}
+                    ${activeSessionModelLabel}
                   </button>
                   <button
                     class="pp-statusbar-model"
@@ -3862,16 +2440,15 @@ const template = () => {
                 </div>
               </div>
             `}
-      </div>
+      </main>
     </div>
 
     <!-- Dialogs -->
-    ${state.showCreateProjectDialog ? renderCreateProjectDialog() : nothing}
-    ${state.showProjectDirectoryBrowser ? renderProjectDirectoryBrowser() : nothing}
+    ${projectSessionDialog.render()}
     ${state.showModels ? renderModelsDialog() : nothing}
     ${state.showThinkingLevels ? renderThinkingLevelsDialog() : nothing}
     ${state.showActions ? renderActionsDialog() : nothing}
-    ${state.pendingExtensionUi ? renderExtensionUiDialog(state.pendingExtensionUi) : nothing}
+    ${extensionUi.renderDialog()}
   </div>
 `;
 };
@@ -3928,117 +2505,7 @@ function renderSidebarItem(session: ApiSessionListItem) {
   `;
 }
 
-/* ─── Message rendering ─── */
 
-function renderMessage(
-  message: ApiSessionSnapshot["messages"][number],
-  messageActionContext: MessageActionContext | undefined,
-  groupedToolResults: ToolResultMessage[][] = [],
-  toolExecutionMatches: Array<ApiSessionSnapshot["toolExecutions"][number] | undefined> = [],
-  assistantParts?: AssistantMessagePart[],
-) {
-  if (message.role === "user" || message.role === "user-with-attachments") {
-    return renderMessageRow(
-      "user",
-      html`
-        <div class="pp-msg-user">
-          <div class="pp-msg-user-label">YOU</div>
-          <div class="pp-msg-user-text">${message.text}</div>
-        </div>
-      `,
-      renderMessageActions(message, messageActionContext, message.text),
-    );
-  }
-
-  if (message.role === "assistant") {
-    const parts = assistantParts ?? getAssistantMessageParts(message);
-    let toolCallIndex = 0;
-    return html`${parts.map((part, partIndex) => {
-      if (part.type === "toolCall") {
-        const currentToolCallIndex = toolCallIndex++;
-        return renderToolCallMessage(
-          part.toolCall,
-          getToolCardKey("message", message.id, "tool-call", String(partIndex)),
-          groupedToolResults[currentToolCallIndex] ?? [],
-          toolExecutionMatches[currentToolCallIndex],
-        );
-      }
-
-      if (part.type === "thinking") {
-        return renderMessageRow(
-          "assistant",
-          html`
-            <div class="pp-msg-assistant">
-              ${renderThinking(part.text)}
-            </div>
-          `,
-        );
-      }
-
-      return renderMessageRow(
-        "assistant",
-        html`
-          <div class="pp-msg-assistant">
-            ${renderMarkdown(part.text)}
-          </div>
-        `,
-        renderMessageActions(message, messageActionContext, part.text),
-      );
-    })}`;
-  }
-
-  if (message.role === "toolResult") {
-    const status = getToolResultState(message);
-    return renderToolActivityCard({
-      cardKey: getToolCardKey("message", message.id, "tool-result"),
-      title: status === "error" ? "Tool error" : "Tool result",
-      preview: summarizeToolExecutionPreview(message.text),
-      status,
-      variant: "result",
-      secondaryLabel: "result",
-      detail: html`
-        <div class="pp-tool-section pp-tool-section-result">
-          <div class="pp-tool-section-label">${status === "error" ? "Error" : "Result"}</div>
-          <div class="pp-tool-section-body">${renderStructuredBlock(message.text)}</div>
-        </div>
-      `,
-    });
-  }
-
-  // Extension / custom messages
-  return renderMessageRow(
-    "extension",
-    html`
-      <div class="pp-msg-assistant" style="opacity:0.85;">
-        <div style="font-size:0.6875rem;font-weight:600;text-transform:uppercase;color:var(--pp-text-muted);margin-bottom:0.125rem;">
-          ${message.role}
-        </div>
-        ${renderMarkdown(message.text)}
-      </div>
-    `,
-  );
-}
-
-/* ─── Tool cards ─── */
-
-function renderToolCard(tool: ApiSessionSnapshot["toolExecutions"][number]) {
-  return renderToolActivityCard({
-    cardKey: getToolCardKey("execution", tool.toolCallId),
-    title: tool.toolName,
-    preview: summarizeToolExecutionPreview(tool.text),
-    status: tool.status,
-    variant: "live",
-    secondaryLabel: tool.status === "running" ? "live" : undefined,
-    detail: html`
-      <div class="pp-tool-section pp-tool-section-result">
-        <div class="pp-tool-section-label">${tool.status === "error" ? "Error" : "Output"}</div>
-        <div class="pp-tool-section-body">
-          ${tool.text ? renderStructuredBlock(tool.text) : html`<span class="pp-tool-inline-note">Running…</span>`}
-        </div>
-      </div>
-    `,
-  });
-}
 
 /* ─── Menu dropdown ─── */
 
@@ -4130,256 +2597,6 @@ function renderAttachmentsRow() {
   `;
 }
 
-/* ─── ANSI rendering ─── */
-
-type AnsiStyleState = {
-  fg?: string;
-  bg?: string;
-  bold?: boolean;
-  dim?: boolean;
-  italic?: boolean;
-  underline?: boolean;
-};
-
-function escapeAnsiHtml(text: string) {
-  return text
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-function ansi16ColorToCss(code: number) {
-  const colors = [
-    "#000000",
-    "#cd3131",
-    "#0dbc79",
-    "#e5e510",
-    "#2472c8",
-    "#bc3fbc",
-    "#11a8cd",
-    "#e5e5e5",
-    "#666666",
-    "#f14c4c",
-    "#23d18b",
-    "#f5f543",
-    "#3b8eea",
-    "#d670d6",
-    "#29b8db",
-    "#ffffff",
-  ];
-  const color = colors[code];
-  if (!color) throw new Error(`Unsupported ANSI color code: ${code}`);
-  return color;
-}
-
-function ansi256ColorToCss(code: number) {
-  if (code < 0 || code > 255) return undefined;
-  if (code < 16) return ansi16ColorToCss(code);
-  if (code >= 232) {
-    const channel = 8 + ((code - 232) * 10);
-    return `rgb(${channel}, ${channel}, ${channel})`;
-  }
-
-  const index = code - 16;
-  const red = Math.floor(index / 36);
-  const green = Math.floor((index % 36) / 6);
-  const blue = index % 6;
-  const toChannel = (value: number) => value === 0 ? 0 : (value * 40) + 55;
-  return `rgb(${toChannel(red)}, ${toChannel(green)}, ${toChannel(blue)})`;
-}
-
-function parseAnsiColor(params: number[], index: number) {
-  const mode = params[index + 1];
-  if (mode === 5) {
-    const code = params[index + 2];
-    return {
-      color: typeof code === "number" ? ansi256ColorToCss(code) : undefined,
-      nextIndex: index + 2,
-    };
-  }
-
-  if (mode === 2) {
-    const red = params[index + 2];
-    const green = params[index + 3];
-    const blue = params[index + 4];
-    const isValid = [red, green, blue].every((value) => typeof value === "number" && value >= 0 && value <= 255);
-    return {
-      color: isValid ? `rgb(${red}, ${green}, ${blue})` : undefined,
-      nextIndex: index + 4,
-    };
-  }
-
-  return {
-    color: undefined,
-    nextIndex: index,
-  };
-}
-
-function ansiStyleToCss(style: AnsiStyleState) {
-  const rules = [
-    style.fg ? `color:${style.fg}` : undefined,
-    style.bg ? `background-color:${style.bg}` : undefined,
-    style.bold ? "font-weight:600" : undefined,
-    style.dim ? "opacity:0.72" : undefined,
-    style.italic ? "font-style:italic" : undefined,
-    style.underline ? "text-decoration:underline" : undefined,
-  ].filter((value): value is string => Boolean(value));
-
-  return rules.join(";");
-}
-
-function renderAnsiHtml(text: string) {
-  const pattern = /\x1b\[([0-9;]*)m/g;
-  const style: AnsiStyleState = {};
-  let cursor = 0;
-  let result = "";
-
-  const appendChunk = (chunk: string) => {
-    if (!chunk) return;
-    const escaped = escapeAnsiHtml(chunk);
-    const css = ansiStyleToCss(style);
-    result += css ? `<span style="${css}">${escaped}</span>` : escaped;
-  };
-
-  for (const match of text.matchAll(pattern)) {
-    const index = match.index ?? 0;
-    appendChunk(text.slice(cursor, index));
-    cursor = index + match[0].length;
-
-    const params = match[1]
-      ? match[1].split(";").map((value) => Number.parseInt(value, 10)).filter((value) => Number.isFinite(value))
-      : [0];
-
-    for (let paramIndex = 0; paramIndex < params.length; paramIndex += 1) {
-      const code = params[paramIndex] ?? 0;
-      switch (code) {
-        case 0:
-          delete style.fg;
-          delete style.bg;
-          delete style.bold;
-          delete style.dim;
-          delete style.italic;
-          delete style.underline;
-          break;
-        case 1:
-          style.bold = true;
-          break;
-        case 2:
-          style.dim = true;
-          break;
-        case 3:
-          style.italic = true;
-          break;
-        case 4:
-          style.underline = true;
-          break;
-        case 22:
-          delete style.bold;
-          delete style.dim;
-          break;
-        case 23:
-          delete style.italic;
-          break;
-        case 24:
-          delete style.underline;
-          break;
-        case 39:
-          delete style.fg;
-          break;
-        case 49:
-          delete style.bg;
-          break;
-        default:
-          if (code >= 30 && code <= 37) {
-            style.fg = ansi16ColorToCss(code - 30);
-            break;
-          }
-          if (code >= 90 && code <= 97) {
-            style.fg = ansi16ColorToCss((code - 90) + 8);
-            break;
-          }
-          if (code >= 40 && code <= 47) {
-            style.bg = ansi16ColorToCss(code - 40);
-            break;
-          }
-          if (code >= 100 && code <= 107) {
-            style.bg = ansi16ColorToCss((code - 100) + 8);
-            break;
-          }
-          if (code === 38 || code === 48) {
-            const { color, nextIndex } = parseAnsiColor(params, paramIndex);
-            if (code === 38) {
-              if (color) {
-                style.fg = color;
-              } else {
-                delete style.fg;
-              }
-            } else if (color) {
-              style.bg = color;
-            } else {
-              delete style.bg;
-            }
-            paramIndex = nextIndex;
-          }
-          break;
-      }
-    }
-  }
-
-  appendChunk(text.slice(cursor));
-  return result;
-}
-
-function renderAnsiText(text: string, className = "") {
-  return html`<span class=${className}>${unsafeHTML(renderAnsiHtml(text))}</span>`;
-}
-
-/* ─── Extension widgets ─── */
-
-function renderExtensionSurface(surface: ApiExtensionSurface | undefined, kind: "header" | "footer") {
-  if (!surface || surface.lines.length === 0) return nothing;
-  return html`
-    <div class="pp-extension-surface pp-extension-surface-${kind}">
-      <pre>${unsafeHTML(renderAnsiHtml(surface.lines.join("\n")))}</pre>
-    </div>
-  `;
-}
-
-function renderExtensionWidgets(placement: "aboveEditor" | "belowEditor") {
-  const widgets = state.extensionWidgets.filter((w) => w.placement === placement);
-  if (widgets.length === 0) return nothing;
-  return html`
-    <div style="padding:0 1rem;">
-      ${widgets.map(
-        (w) => html`
-          <div style="margin-bottom:0.5rem;padding:0.5rem 0.75rem;border:1px solid var(--pp-border);border-radius:0.375rem;background:var(--pp-bg-secondary);">
-            <div style="font-size:0.625rem;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;color:var(--pp-text-muted);margin-bottom:0.25rem;">${w.key}</div>
-            <pre style="font-size:0.75rem;line-height:1.5;color:var(--pp-text-muted);white-space:pre-wrap;word-break:break-word;margin:0;">${unsafeHTML(renderAnsiHtml(w.lines.join("\n")))}</pre>
-          </div>
-        `,
-      )}
-    </div>
-  `;
-}
-
-/* ─── Toasts ─── */
-
-function renderToasts() {
-  if (state.extensionNotifications.length === 0) return nothing;
-  return html`
-    <div class="pp-toasts">
-      ${state.extensionNotifications.map((n) => html`
-        <div class="pp-toast ${n.notifyType}">
-          <div class="pp-toast-type">${n.notifyType}</div>
-          <div>${n.message}</div>
-        </div>
-      `)}
-    </div>
-  `;
-}
-
 function renderSlashCommandPalette() {
   const visibleSlashCommands = getVisibleSlashCommands();
   if (visibleSlashCommands.length === 0) {
@@ -4409,111 +2626,6 @@ function renderSlashCommandPalette() {
             : nothing}
         </button>
       `)}
-    </div>
-  `;
-}
-
-/* ─── Project dialog ─── */
-
-function renderCreateProjectDialog() {
-  return html`
-    <div class="pp-dialog-overlay" @click=${closeCreateProjectDialog}>
-      <div class="pp-dialog" @click=${(event: Event) => event.stopPropagation()}>
-        <div class="pp-dialog-title">Open project</div>
-        <div class="pp-dialog-subtitle">
-          Choose a directory on the machine running Pi Web. You can paste a path or browse it here.
-        </div>
-        <div class="pp-dialog-section">
-          <div class="pp-dialog-section-title">Project directory</div>
-          <div class="pp-dialog-section-desc">The new session will use this directory as its working tree.</div>
-          <div style="display:flex; gap:0.5rem; align-items:center;">
-            <input
-              class="pp-dialog-input"
-              type="text"
-              placeholder="/path/to/project"
-              .value=${state.newProjectPath}
-              @input=${updateNewProjectPath}
-              @keydown=${handleCreateProjectPathKeyDown}
-            />
-            <button class="pp-dialog-btn" @click=${openProjectDirectoryBrowser} ?disabled=${state.isCreatingProjectSession}>
-              Browse
-            </button>
-          </div>
-          ${state.newProjectError
-            ? html`<div class="pp-error" style="margin-top:0.75rem;">${state.newProjectError}</div>`
-            : nothing}
-        </div>
-        <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
-          <button class="pp-dialog-btn" @click=${closeCreateProjectDialog} ?disabled=${state.isCreatingProjectSession}>
-            Cancel
-          </button>
-          <button class="pp-dialog-btn primary" @click=${() => void createProjectSession()} ?disabled=${state.isCreatingProjectSession}>
-            ${state.isCreatingProjectSession ? "Creating…" : "Create session"}
-          </button>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-function renderProjectDirectoryBrowser() {
-  const canUseDirectory = !state.isLoadingProjectDirectories
-    && state.directoryBrowserPath.trim() === state.directoryBrowserLoadedPath;
-
-  return html`
-    <div class="pp-dialog-overlay" @click=${closeProjectDirectoryBrowser}>
-      <div class="pp-dialog pp-directory-browser-dialog" @click=${(event: Event) => event.stopPropagation()}>
-        <div class="pp-dialog-title">Browse project directory</div>
-        <div class="pp-dialog-subtitle">
-          This browser lists directories on the Pi Web server, so the selected path works for the agent session.
-        </div>
-
-        <div class="pp-directory-browser-path-row">
-          <input
-            class="pp-dialog-input pp-directory-browser-path-input"
-            type="text"
-            aria-label="Directory path"
-            .value=${state.directoryBrowserPath}
-            @input=${updateDirectoryBrowserPath}
-            @keydown=${handleDirectoryBrowserPathKeyDown}
-          />
-          <button class="pp-dialog-btn" @click=${() => void loadProjectDirectories(state.directoryBrowserPath)} ?disabled=${state.isLoadingProjectDirectories}>
-            Go
-          </button>
-        </div>
-
-        <div class="pp-directory-browser-toolbar">
-          <button
-            class="pp-dialog-btn"
-            @click=${() => state.directoryBrowserParentPath ? void loadProjectDirectories(state.directoryBrowserParentPath) : undefined}
-            ?disabled=${state.isLoadingProjectDirectories || !state.directoryBrowserParentPath}
-          >Up</button>
-        </div>
-
-        ${state.directoryBrowserError
-          ? html`<div class="pp-error" style="margin-bottom:0.75rem;">${state.directoryBrowserError}</div>`
-          : nothing}
-
-        <div class="pp-directory-browser-list" aria-label="Directories">
-          ${state.isLoadingProjectDirectories
-            ? html`<div class="pp-dialog-empty">Loading directories…</div>`
-            : state.directoryBrowserEntries.length > 0
-              ? state.directoryBrowserEntries.map((entry) => html`
-                  <button class="pp-dialog-item pp-directory-browser-entry" @click=${() => void loadProjectDirectories(entry.path)}>
-                    <div class="pp-dialog-item-title">${entry.name}</div>
-                    <div class="pp-dialog-item-desc">${entry.path}</div>
-                  </button>
-                `)
-              : html`<div class="pp-dialog-empty">No subdirectories.</div>`}
-        </div>
-
-        <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
-          <button class="pp-dialog-btn" @click=${closeProjectDirectoryBrowser}>Cancel</button>
-          <button class="pp-dialog-btn primary" @click=${useDirectoryBrowserPath} ?disabled=${!canUseDirectory}>
-            Use this directory
-          </button>
-        </div>
-      </div>
     </div>
   `;
 }
@@ -4586,8 +2698,13 @@ function renderThinkingLevelsDialog() {
         </div>
         ${visibleLevels.map((level) => {
           const isCurrent = level === currentLevel;
+          const dialogLabel = level === "xhigh" ? "Maximum thinking" : formatThinkingLevel(level);
           return html`
-            <button class="pp-dialog-item" @click=${() => void setThinkingLevel(level)}>
+            <button
+              class="pp-dialog-item"
+              aria-label=${isCurrent ? `${dialogLabel} Current` : dialogLabel}
+              @click=${() => void setThinkingLevel(level)}
+            >
               <div class="pp-dialog-item-header">
                 <div class="pp-dialog-item-title">${formatThinkingLevel(level)}</div>
                 <div class="pp-dialog-item-badges">
@@ -4662,65 +2779,6 @@ function renderActionsDialog() {
                 )
               : html`<div style="font-size:0.8125rem;color:var(--pp-text-muted);">No prompts for forking yet.</div>`}
         </div>
-      </div>
-    </div>
-  `;
-}
-
-/* ─── Extension UI dialog ─── */
-
-function renderExtensionUiDialog(request: ApiExtensionUiRequest) {
-  return html`
-    <div class="pp-dialog-overlay" @click=${() => submitExtensionUiResponse({ cancelled: true })}>
-      <div class="pp-dialog" @click=${(e: Event) => e.stopPropagation()}>
-        <div class="pp-dialog-title">${request.title}</div>
-        ${request.message ? html`<div class="pp-dialog-subtitle">${request.message}</div>` : nothing}
-        ${request.timeout
-          ? html`<div style="font-size:0.75rem;color:var(--pp-text-muted);margin-bottom:0.5rem;">Expires in ~${Math.ceil(request.timeout / 1000)}s</div>`
-          : nothing}
-
-        ${request.method === "select"
-          ? html`${request.options?.map(
-              (opt) => html`
-                <button class="pp-dialog-item" @click=${() => submitExtensionUiResponse({ value: opt })}>
-                  ${opt}
-                </button>
-              `,
-            )}`
-          : nothing}
-
-        ${request.method === "confirm"
-          ? html`
-              <div style="display:flex;gap:0.375rem;">
-                <button class="pp-dialog-btn" style="flex:1;" @click=${() => submitExtensionUiResponse({ cancelled: true })}>Cancel</button>
-                <button class="pp-dialog-btn primary" style="flex:1;" @click=${() => submitExtensionUiResponse({ confirmed: true })}>Confirm</button>
-              </div>
-            `
-          : nothing}
-
-        ${request.method === "input" || request.method === "editor"
-          ? html`
-              ${request.method === "input"
-                ? html`<input
-                    class="pp-dialog-input"
-                    style="margin-bottom:0.5rem;"
-                    .value=${state.extensionUiValue}
-                    @input=${handleExtensionUiValueInput}
-                    placeholder=${request.placeholder ?? ""}
-                  />`
-                : html`<textarea
-                    class="pp-dialog-input"
-                    style="margin-bottom:0.5rem;min-height:10rem;font-family:monospace;"
-                    .value=${state.extensionUiValue}
-                    @input=${handleExtensionUiValueInput}
-                    placeholder=${request.placeholder ?? ""}
-                  ></textarea>`}
-              <div style="display:flex;gap:0.375rem;">
-                <button class="pp-dialog-btn" style="flex:1;" @click=${() => submitExtensionUiResponse({ cancelled: true })}>Cancel</button>
-                <button class="pp-dialog-btn primary" style="flex:1;" @click=${() => submitExtensionUiResponse({ value: state.extensionUiValue })}>Submit</button>
-              </div>
-            `
-          : nothing}
       </div>
     </div>
   `;

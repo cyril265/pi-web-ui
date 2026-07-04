@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { utimesSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   activeConversation,
@@ -19,6 +20,7 @@ test.describe.serial("broad real-interaction scenarios", () => {
   test("desktop boot covers session list, sidebar docking, display persistence, markdown, diff, and tool activity", async ({
     page,
     context,
+    request,
   }) => {
     await context.grantPermissions(["clipboard-read", "clipboard-write"], {
       origin: "http://127.0.0.1:3310",
@@ -76,7 +78,11 @@ test.describe.serial("broad real-interaction scenarios", () => {
 
     const thinkingBlock = page.locator(".pp-thinking").filter({ hasText: "Inspecting the fixture session." }).first();
     await expect(thinkingBlock).toBeVisible();
+    await expect(thinkingBlock).not.toHaveAttribute("open", "");
     await expect(thinkingBlock.locator(".pp-thinking-label")).toHaveText("Thinking");
+    await expect(thinkingBlock.locator(".pp-thinking-content")).toBeHidden();
+    await thinkingBlock.locator("summary").click();
+    await expect(thinkingBlock).toHaveAttribute("open", "");
     await expect(thinkingBlock.locator(".pp-thinking-content")).toContainText("Preparing markdown, diff, and tool activity examples for the UI.");
 
     const typeScriptBlock = primaryAssistantMessage
@@ -117,20 +123,39 @@ test.describe.serial("broad real-interaction scenarios", () => {
 
     const successfulTool = toolCard(page, "bash");
     await expect(successfulTool).toBeVisible();
+    await expect(successfulTool).not.toHaveAttribute("open", "");
     await expect(successfulTool.locator(".pp-tool-status.done")).toHaveText("Done");
     await expect(successfulTool.locator(".pp-tool-preview")).toContainText("app.css");
 
     const failedTool = toolCard(page, "read_file");
     await expect(failedTool).toBeVisible();
-    await expect(failedTool).toHaveAttribute("open", "");
+    await expect(failedTool).not.toHaveAttribute("open", "");
     await expect(failedTool.locator(".pp-tool-status.error")).toHaveText("Failed");
     await expect(failedTool.locator(".pp-tool-preview")).toContainText("permission denied");
-    await expect(failedTool.locator(".pp-tool-section-label").filter({ hasText: "Error" })).toBeVisible();
 
     const successfulReadTool = toolCard(page, "read");
     await expect(successfulReadTool).toBeVisible();
+    await expect(successfulReadTool).not.toHaveAttribute("open", "");
     await expect(successfulReadTool.locator(".pp-tool-status.done")).toHaveText("Done");
     await expect(successfulReadTool.locator(".pp-tool-preview")).toContainText('export type SessionStatus = "idle" | "streaming" | "error";');
+
+    await expect(page.locator(".pp-tool-card[open]")).toHaveCount(0);
+
+    await failedTool.locator("summary").click();
+    await expect(failedTool).toHaveAttribute("open", "");
+    await expect(failedTool.locator(".pp-tool-section-label").filter({ hasText: "Error" })).toBeVisible();
+
+    const sessionsResponse = await request.get("/api/sessions?scope=all");
+    await expect(sessionsResponse).toBeOK();
+    const { sessions } = await sessionsResponse.json() as { sessions: Array<{ title: string; sessionFile: string }> };
+    const secondarySession = sessions.find((session) => session.title === SECONDARY_SESSION_TITLE);
+    expect(secondarySession?.sessionFile).toBeTruthy();
+    const updatedAt = new Date();
+    utimesSync(secondarySession!.sessionFile, updatedAt, updatedAt);
+    await expect(sessionItem(page, SECONDARY_SESSION_TITLE, 2).locator(".pp-session-time")).toHaveText("just now");
+
+    await successfulReadTool.locator("summary").click();
+    await expect(successfulReadTool).toHaveAttribute("open", "");
     await expect(successfulReadTool.locator(".pp-tool-section-label").filter({ hasText: "Result" })).toBeVisible();
 
     await chooseMenuItem(page, "Default");

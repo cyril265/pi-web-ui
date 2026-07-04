@@ -1,5 +1,5 @@
 import { existsSync, watch } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -21,7 +21,8 @@ import type {
 import { bindSessionExtensions, getRegisteredExtensionCommands } from "./extension-bridge.js";
 import { GlobalMutationTracker } from "./global-mutation-tracker.js";
 import { LiveSession } from "./live-session.js";
-import { deriveTitle, extractMessageText, serializeModel } from "./serialize.js";
+import { SessionCatalog } from "./session-catalog.js";
+import { extractMessageText, serializeModel } from "./serialize.js";
 
 const INTERNAL_CHANGE_WINDOW_MS = 5_000;
 const LIVE_SESSION_DISPOSE_DELAY_MS = 30_000;
@@ -48,7 +49,14 @@ const createSlashCommand = (
 type CreateAgentSessionResult = Awaited<ReturnType<typeof createAgentSession>>;
 type AgentSession = CreateAgentSessionResult["session"];
 type PiSessionManager = ReturnType<typeof SessionManager.create>;
+type SdkImageContent = NonNullable<NonNullable<Parameters<AgentSession["prompt"]>[1]>["images"]>[number];
+type SdkThinkingLevel = Parameters<AgentSession["setThinkingLevel"]>[0];
 type SessionShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
+type SessionListSubscriber = () => void;
+
+const sdkThinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const satisfies readonly SdkThinkingLevel[];
+const isSdkThinkingLevel = (thinkingLevel: ThinkingLevel): thinkingLevel is SdkThinkingLevel =>
+  sdkThinkingLevels.includes(thinkingLevel as SdkThinkingLevel);
 
 export class SessionRegistry {
   private readonly authStorage;
@@ -56,37 +64,36 @@ export class SessionRegistry {
   private readonly liveSessions = new Map<string, LiveSession>();
   private readonly liveSessionsByPath = new Map<string, LiveSession>();
   private readonly scheduledSessionDisposals = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly sessionListSubscribers = new Set<SessionListSubscriber>();
+  private sessionListChangeTimeout: ReturnType<typeof setTimeout> | undefined;
   private activeGlobalSessionId: string | undefined;
   private readonly sessionDir: string;
+  private readonly sessionCatalog: SessionCatalog;
 
   constructor(
     readonly cwd: string,
     readonly agentDir = resolve(process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent")),
   ) {
     this.sessionDir = join(this.agentDir, "sessions");
+    this.sessionCatalog = new SessionCatalog(
+      this.cwd,
+      this.sessionDir,
+      (sessionFile) => this.getLiveSessionForSessionFile(sessionFile),
+    );
     this.authStorage = AuthStorage.create(join(this.agentDir, "auth.json"));
     this.modelRegistry = ModelRegistry.create(this.authStorage, join(this.agentDir, "models.json"));
     this.startWatchingSessionsDirectory();
   }
 
   async listSessions(scope: "current" | "all" = "current"): Promise<ApiSessionListItem[]> {
-    const listed = scope === "all"
-      ? await this.listAllSessions()
-      : await SessionManager.list(this.cwd, this.sessionDir);
+    return this.sessionCatalog.listSessions(scope);
+  }
 
-    return listed
-      .map((sessionInfo) =>
-        this.toSessionListItem({
-          id: String(sessionInfo.id),
-          path: sessionInfo.path,
-          cwd: sessionInfo.cwd ? String(sessionInfo.cwd) : undefined,
-          name: sessionInfo.name ? String(sessionInfo.name) : undefined,
-          firstMessage: sessionInfo.firstMessage ? String(sessionInfo.firstMessage) : undefined,
-          modified: sessionInfo.modified,
-          messageCount: sessionInfo.messageCount,
-        }),
-      )
-      .sort((left, right) => (right.lastModified ?? "").localeCompare(left.lastModified ?? ""));
+  subscribeToSessionListChanges(subscriber: SessionListSubscriber) {
+    this.sessionListSubscribers.add(subscriber);
+    return () => {
+      this.sessionListSubscribers.delete(subscriber);
+    };
   }
 
   async createSession(targetCwd = this.cwd) {
@@ -179,6 +186,7 @@ export class SessionRegistry {
   prompt(sessionId: string, message: string, images: ApiImageInput[]) {
     const liveSession = this.mustGetSession(sessionId);
     this.prepareForSessionMutation(liveSession);
+    normalizeSessionImageContent(liveSession.session);
     void liveSession.session.prompt(message, images.length > 0 ? { images: images.map(toSdkImage) } : undefined)
       .catch((error: unknown) => {
         liveSession.publish({
@@ -192,6 +200,7 @@ export class SessionRegistry {
   steer(sessionId: string, message: string) {
     const liveSession = this.mustGetSession(sessionId);
     this.prepareForSessionMutation(liveSession);
+    normalizeSessionImageContent(liveSession.session);
     void liveSession.session.steer(message).catch((error: unknown) => {
       liveSession.publish({
         type: "error",
@@ -204,6 +213,7 @@ export class SessionRegistry {
   followUp(sessionId: string, message: string) {
     const liveSession = this.mustGetSession(sessionId);
     this.prepareForSessionMutation(liveSession);
+    normalizeSessionImageContent(liveSession.session);
     void liveSession.session.followUp(message).catch((error: unknown) => {
       liveSession.publish({
         type: "error",
@@ -248,6 +258,10 @@ export class SessionRegistry {
   }
 
   setThinkingLevel(sessionId: string, thinkingLevel: ThinkingLevel) {
+    if (!isSdkThinkingLevel(thinkingLevel)) {
+      throw new Error(`Unsupported thinking level: ${thinkingLevel}`);
+    }
+
     const liveSession = this.mustGetSession(sessionId);
     this.prepareForSessionMutation(liveSession);
     liveSession.session.setThinkingLevel(thinkingLevel);
@@ -338,6 +352,20 @@ export class SessionRegistry {
     }
 
     this.cancelScheduledSessionDisposal(sessionId);
+    return liveSession;
+  }
+
+  private getLiveSessionForSessionFile(sessionFile: string) {
+    const liveSessionByPath = this.liveSessionsByPath.get(sessionFile);
+    const liveSession = liveSessionByPath
+      && this.liveSessions.get(String(liveSessionByPath.session.sessionId)) === liveSessionByPath
+      ? liveSessionByPath
+      : undefined;
+
+    if (liveSessionByPath && !liveSession) {
+      this.liveSessionsByPath.delete(sessionFile);
+    }
+
     return liveSession;
   }
 
@@ -559,6 +587,8 @@ export class SessionRegistry {
       })
     );
 
+    normalizeSessionImageContent(result.session);
+
     return {
       session: result.session,
       globalMutationTracker: tracker,
@@ -629,54 +659,6 @@ export class SessionRegistry {
     return liveSession;
   }
 
-  private async listAllSessions() {
-    const sessionFiles = await this.getSessionFiles(this.sessionDir);
-
-    return Promise.all(
-      sessionFiles.map(async (sessionFile) => {
-        const sessionManager = SessionManager.open(sessionFile);
-        const entries = sessionManager.getEntries();
-        const header = sessionManager.getHeader?.();
-        const firstUserEntry = entries.find(
-          (entry: any) =>
-            entry.type === "message" &&
-            (entry.message?.role === "user" || entry.message?.role === "user-with-attachments"),
-        ) as any;
-        const firstUserMessage = firstUserEntry?.message;
-        const sessionStats = await stat(sessionFile);
-
-        return {
-          id: String(sessionManager.getSessionId()),
-          path: sessionFile,
-          cwd: typeof header?.cwd === "string" ? header.cwd : undefined,
-          name: sessionManager.getSessionName?.(),
-          firstMessage: firstUserMessage ? extractMessageText(firstUserMessage) : "",
-          modified: sessionStats.mtimeMs,
-          messageCount: entries.filter((entry: any) => entry.type === "message").length,
-        };
-      }),
-    );
-  }
-
-  private async getSessionFiles(directory: string): Promise<string[]> {
-    if (!existsSync(directory)) {
-      return [];
-    }
-
-    const entries = await readdir(directory, { withFileTypes: true });
-    const files = await Promise.all(
-      entries.map(async (entry) => {
-        const fullPath = join(directory, entry.name);
-        if (entry.isDirectory()) {
-          return this.getSessionFiles(fullPath);
-        }
-        return fullPath.endsWith(".jsonl") ? [fullPath] : [];
-      }),
-    );
-
-    return files.flat();
-  }
-
   private getUserMessages(sessionId: string): ApiTreeMessage[] {
     const liveSession = this.mustGetSession(sessionId);
     const currentLeafId = liveSession.sessionManager.getLeafId?.();
@@ -702,56 +684,6 @@ export class SessionRegistry {
         isOnCurrentPath: entry.isOnCurrentPath,
       }))
       .reverse();
-  }
-
-  private toSessionListItem(sessionInfo: {
-    id: string;
-    path: string;
-    cwd: string | undefined;
-    name: string | undefined;
-    firstMessage: string | undefined;
-    modified: number | string | Date | undefined;
-    messageCount: number | undefined;
-  }): ApiSessionListItem {
-    const liveSessionByPath = this.liveSessionsByPath.get(sessionInfo.path);
-    const liveSession = liveSessionByPath
-      && this.liveSessions.get(String(liveSessionByPath.session.sessionId)) === liveSessionByPath
-      ? liveSessionByPath
-      : undefined;
-
-    if (liveSessionByPath && !liveSession) {
-      this.liveSessionsByPath.delete(sessionInfo.path);
-    }
-
-    const sessionName = sessionInfo.name ? String(sessionInfo.name) : liveSession?.getSessionName();
-    const sessionCwd = sessionInfo.cwd ? String(sessionInfo.cwd) : undefined;
-
-    return {
-      id: liveSession ? String(liveSession.session.sessionId) : String(sessionInfo.id),
-      sessionFile: sessionInfo.path,
-      cwd: sessionCwd,
-      isInCurrentWorkspace: this.isCurrentWorkspace(sessionCwd),
-      title: deriveTitle({
-        messages: sessionInfo.firstMessage
-          ? [{ id: "preview", role: "user", text: sessionInfo.firstMessage, timestamp: undefined }]
-          : [],
-        sessionFile: sessionInfo.path,
-        sessionName,
-      }),
-      preview: String(sessionInfo.firstMessage ?? ""),
-      lastModified: sessionInfo.modified ? new Date(sessionInfo.modified).toISOString() : undefined,
-      messageCount: Number(sessionInfo.messageCount ?? 0),
-      modelId: liveSession?.session.model?.id,
-      thinkingLevel: liveSession ? String(liveSession.session.thinkingLevel) : undefined,
-      status: liveSession?.session.isStreaming ? "streaming" : "idle",
-      live: Boolean(liveSession),
-      externallyDirty: liveSession?.externallyDirty ?? false,
-    };
-  }
-
-  private isCurrentWorkspace(sessionCwd: string | undefined) {
-    if (!sessionCwd) return false;
-    return resolve(sessionCwd) === this.cwd;
   }
 
   private async registerSession(
@@ -788,43 +720,50 @@ export class SessionRegistry {
       suppressNotifications: boolean;
     },
   ) {
-    const { tracker } = await GlobalMutationTracker.capture(() => bindSessionExtensions({
-      session,
-      uiContext: liveSession.createExtensionUiContext({ suppressNotifications: options.suppressNotifications }),
-      commandContextActions: {
-        waitForIdle: () => session.agent.waitForIdle(),
-        newSession: async (options: any) => {
-          liveSession.expectInternalSessionWrites();
-          return this.startNewLiveSession(liveSession, options);
-        },
-        fork: async (entryId: string, options: any) => {
-          liveSession.expectInternalSessionWrites();
-          const result = await this.forkLiveSession(liveSession, entryId, options);
-          return { cancelled: result.cancelled };
-        },
-        navigateTree: async (targetId: string, options: any) => {
-          liveSession.expectInternalSessionWrites();
-          const result = await session.navigateTree(targetId, options);
-          liveSession.resetAfterSessionMutation();
-          return { cancelled: result.cancelled };
-        },
-        switchSession: async (sessionPath: string, options: any) => {
-          liveSession.expectInternalSessionWrites();
-          return this.switchLiveSession(liveSession, sessionPath, options);
-        },
-        reload: async () => {
-          liveSession.expectInternalSessionWrites();
-          await session.reload();
-          liveSession.publishSnapshot();
-        },
-      },
-      onError: (error: { error: string }) => {
-        liveSession.publish({
-          type: "error",
-          message: error.error,
+    const { tracker } = await GlobalMutationTracker.capture(async () => {
+      liveSession.setExtensionNotificationsSuppressed(options.suppressNotifications);
+      try {
+        await bindSessionExtensions({
+          session,
+          uiContext: liveSession.createExtensionUiContext(),
+          commandContextActions: {
+            waitForIdle: () => session.agent.waitForIdle(),
+            newSession: async (options: any) => {
+              liveSession.expectInternalSessionWrites();
+              return this.startNewLiveSession(liveSession, options);
+            },
+            fork: async (entryId: string, options: any) => {
+              liveSession.expectInternalSessionWrites();
+              const result = await this.forkLiveSession(liveSession, entryId, options);
+              return { cancelled: result.cancelled };
+            },
+            navigateTree: async (targetId: string, options: any) => {
+              liveSession.expectInternalSessionWrites();
+              const result = await session.navigateTree(targetId, options);
+              liveSession.resetAfterSessionMutation();
+              return { cancelled: result.cancelled };
+            },
+            switchSession: async (sessionPath: string, options: any) => {
+              liveSession.expectInternalSessionWrites();
+              return this.switchLiveSession(liveSession, sessionPath, options);
+            },
+            reload: async () => {
+              liveSession.expectInternalSessionWrites();
+              await session.reload();
+              liveSession.publishSnapshot();
+            },
+          },
+          onError: (error: { error: string }) => {
+            liveSession.publish({
+              type: "error",
+              message: error.error,
+            });
+          },
         });
-      },
-    }));
+      } finally {
+        liveSession.setExtensionNotificationsSuppressed(false);
+      }
+    });
 
     return tracker;
   }
@@ -930,6 +869,19 @@ export class SessionRegistry {
     return liveSession.subscribers.size === 0 && !Boolean(liveSession.session.isStreaming);
   }
 
+  private scheduleSessionListChange() {
+    if (this.sessionListChangeTimeout) {
+      return;
+    }
+
+    this.sessionListChangeTimeout = setTimeout(() => {
+      this.sessionListChangeTimeout = undefined;
+      for (const subscriber of this.sessionListSubscribers) {
+        subscriber();
+      }
+    }, 150);
+  }
+
   private startWatchingSessionsDirectory() {
     if (!existsSync(this.sessionDir)) {
       return;
@@ -938,6 +890,10 @@ export class SessionRegistry {
     watch(this.sessionDir, { recursive: true }, (_eventType, fileName) => {
       if (!fileName) return;
       const changedPath = join(this.sessionDir, fileName.toString());
+      if (!changedPath.endsWith(".jsonl")) return;
+
+      this.scheduleSessionListChange();
+
       const liveSession = this.liveSessionsByPath.get(changedPath);
       if (!liveSession) return;
 
@@ -951,11 +907,69 @@ export class SessionRegistry {
   }
 }
 
-const toSdkImage = (image: ApiImageInput) => ({
-  type: "image" as const,
-  source: {
-    type: "base64" as const,
-    mediaType: image.mimeType,
-    data: image.data,
-  },
+const toSdkImage = (image: ApiImageInput): SdkImageContent => ({
+  type: "image",
+  data: image.data,
+  mimeType: image.mimeType,
 });
+
+// Older Pi Web builds wrote image blocks with a source wrapper.
+// The current Pi SDK expects canonical ImageContent objects: { type, data, mimeType }.
+const normalizeSessionImageContent = (session: AgentSession) => {
+  const seenMessageArrays = new Set<readonly unknown[]>();
+
+  for (const messages of [session.messages, session.agent.state.messages]) {
+    if (seenMessageArrays.has(messages)) continue;
+    seenMessageArrays.add(messages);
+
+    for (const message of messages) {
+      normalizeMessageImageContent(message);
+    }
+  }
+};
+
+const normalizeMessageImageContent = (message: unknown) => {
+  if (!isRecord(message) || !Array.isArray(message.content)) return;
+
+  let changed = false;
+  const content = message.content.map((part) => {
+    const normalizedPart = normalizeImageContentPart(part);
+    if (normalizedPart !== part) changed = true;
+    return normalizedPart;
+  });
+
+  if (changed) {
+    message.content = content;
+  }
+};
+
+const normalizeImageContentPart = (part: unknown): unknown => {
+  if (!isRecord(part) || part.type !== "image") return part;
+  if (typeof part.data === "string" && typeof part.mimeType === "string") return part;
+
+  const source = isRecord(part.source) ? part.source : undefined;
+  const data = typeof part.data === "string"
+    ? part.data
+    : typeof source?.data === "string"
+      ? source.data
+      : undefined;
+  const mediaType = typeof part.mimeType === "string"
+    ? part.mimeType
+    : typeof source?.mediaType === "string"
+      ? source.mediaType
+      : typeof source?.media_type === "string"
+        ? source.media_type
+        : undefined;
+  const mimeType = mediaType?.trim();
+
+  if (!data || !mimeType) return part;
+
+  return {
+    type: "image" as const,
+    data,
+    mimeType,
+  };
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
