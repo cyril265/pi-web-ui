@@ -261,6 +261,16 @@ button:not(:disabled) {
   }
 }
 
+/* Tighter horizontal gutters on phone-sized screens to reclaim reading width */
+@media (max-width: 900px) {
+  .pp-shell {
+    --pp-header-padding-inline: 0.75rem;
+    --pp-messages-padding-inline: 0.875rem;
+    --pp-composer-padding-inline: 0.75rem;
+    --pp-statusbar-padding-inline: 0.75rem;
+  }
+}
+
 /* ── Header ── */
 .pp-header {
   display: flex;
@@ -277,6 +287,13 @@ button:not(:disabled) {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  min-width: 0;
+}
+
+/* The session title lives in the sub-header on desktop and moves into the top
+   bar on phones (see the max-width media query) to reclaim vertical space. */
+.pp-header-session-title {
+  display: none;
 }
 
 .pp-header-title {
@@ -752,18 +769,53 @@ button:not(:disabled) {
 }
 
 .pp-message-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.375rem;
-  opacity: 0;
-  visibility: hidden;
-  transition: opacity 150ms ease;
+  position: relative;
+  display: inline-block;
 }
 
-.pp-message-row:hover .pp-message-actions,
-.pp-message-row:focus-within .pp-message-actions {
+.pp-message-actions-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.75rem;
+  height: 1.5rem;
+  padding: 0 0.375rem;
+  border-radius: 9999px;
+  color: var(--pp-text-muted);
+  font-size: 1rem;
+  line-height: 1;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  opacity: 0.55;
+  transition: opacity 150ms ease, background 150ms ease, color 150ms ease;
+}
+
+.pp-message-actions-toggle::-webkit-details-marker {
+  display: none;
+}
+
+.pp-message-row:hover .pp-message-actions-toggle,
+.pp-message-row:focus-within .pp-message-actions-toggle,
+.pp-message-actions[open] .pp-message-actions-toggle {
   opacity: 1;
-  visibility: visible;
+  color: var(--pp-text);
+  background: var(--pp-sidebar-hover);
+}
+
+.pp-message-actions-menu {
+  position: absolute;
+  z-index: 10;
+  top: calc(100% + 0.25rem);
+  left: 0;
+  display: flex;
+  gap: 0.375rem;
+  padding: 0.375rem;
+  border: 1px solid var(--pp-border);
+  border-radius: 0.5rem;
+  background: var(--pp-bg-secondary);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
 }
 
 .pp-message-action-btn {
@@ -833,9 +885,32 @@ button:not(:disabled) {
     gap: 0.3125rem;
   }
 
-  .pp-message-actions {
+  .pp-message-actions-toggle {
     opacity: 1;
-    visibility: visible;
+  }
+
+  /* Move the active session title into the top bar and drop the sub-header. */
+  .pp-active-session-header {
+    display: none;
+  }
+
+  .pp-header-left {
+    flex: 1;
+  }
+
+  .pp-header-left:has(.pp-header-session-title) .pp-header-wordmark {
+    display: none;
+  }
+
+  .pp-header-session-title {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-transform: none;
+    letter-spacing: normal;
+    font-weight: 600;
   }
 }
 
@@ -1067,59 +1142,6 @@ button:not(:disabled) {
   color: var(--pp-text-muted);
   margin-bottom: 0.75rem;
   padding-top: 0.125rem;
-}
-
-/* ── Thinking ── */
-.pp-thinking {
-  margin-bottom: 0.5rem;
-}
-
-.pp-thinking-summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.625rem;
-  padding: 0.25rem 0;
-  cursor: pointer;
-  list-style: none;
-}
-
-.pp-thinking-summary::-webkit-details-marker {
-  display: none;
-}
-
-.pp-thinking-label {
-  font-size: 0.6875rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--pp-text-muted);
-}
-
-.pp-thinking-disclosure {
-  color: var(--pp-text-muted);
-  font-size: 0.6875rem;
-  font-weight: 600;
-}
-
-.pp-thinking-disclosure::before {
-  content: "Details";
-}
-
-.pp-thinking[open] .pp-thinking-disclosure::before {
-  content: "Hide";
-}
-
-.pp-thinking-content {
-  font-size: 0.8125rem;
-  color: var(--pp-text-muted);
-  padding: 0.625rem 0.75rem;
-  border: 1px solid var(--pp-border);
-  border-radius: 0.5rem;
-  background: var(--pp-thinking-bg);
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 
 /* ── Error messages ── */

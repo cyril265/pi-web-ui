@@ -2135,7 +2135,9 @@ function renderMessageActions(
     : "Use this prompt for this action";
 
   return html`
-    <div class="pp-message-actions" role="group" aria-label="Message actions">
+    <details class="pp-message-actions">
+      <summary class="pp-message-actions-toggle" title="Message actions" aria-label="Message actions">\u22ef</summary>
+      <div class="pp-message-actions-menu" role="group" aria-label="Message actions">
       <button
         class="pp-message-action-btn"
         type="button"
@@ -2166,7 +2168,8 @@ function renderMessageActions(
         @click=${() => void handleMessageForkFromHere(messageActionContext)}
         aria-label="Fork from here"
       >Fork</button>
-    </div>
+      </div>
+    </details>
   `;
 }
 
@@ -2210,6 +2213,12 @@ const template = () => {
   const workspaceLabel = sessionCwd ? shortenCwd(sessionCwd) : undefined;
   const contextUsageLabel = formatContextUsage(state.activeSession?.contextUsage);
   const runningToolCount = state.activeSession?.toolExecutions.filter((tool) => tool.status === "running").length ?? 0;
+  const lastMessage = state.activeSession?.messages.at(-1);
+  const isReasoning = state.activeSession?.status === "streaming"
+    && runningToolCount === 0
+    && lastMessage?.role === "assistant"
+    && Array.isArray(lastMessage.parts)
+    && lastMessage.parts.at(-1)?.type === "thinking";
   const activeSessionModelLabel = state.activeSession?.model?.name ?? "No model";
 
   return html`
@@ -2225,7 +2234,10 @@ const template = () => {
           aria-label=${state.sidebarOpen ? isMobileSidebarLayout() ? "Close sidebar" : "Collapse sidebar" : isMobileSidebarLayout() ? "Expand sidebar" : "Show session list"}
           aria-expanded=${String(state.sidebarOpen)}
         >\u2630</button>
-        <span class="pp-header-title">Pi Web</span>
+        <span class="pp-header-title pp-header-wordmark">Pi Web</span>
+        ${state.activeSession
+          ? html`<span class="pp-header-title pp-header-session-title" title=${state.activeSession.title}>${state.activeSession.title}</span>`
+          : nothing}
       </div>
       <div class="pp-header-right">
         <button
@@ -2325,7 +2337,7 @@ const template = () => {
                 <div class="pp-session-activity">
                   <span class="pp-session-activity-dot" aria-hidden="true"></span>
                   <span class="pp-session-activity-text">
-                    Agent working…
+                    ${isReasoning ? "Thinking…" : "Agent working…"}
                     ${runningToolCount > 0
                       ? ` ${runningToolCount} tool${runningToolCount === 1 ? "" : "s"} running.`
                       : ""}

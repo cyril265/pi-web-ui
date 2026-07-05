@@ -1047,6 +1047,13 @@ function formatToolCallSummary(toolName: string, argsValue: unknown): { verb: st
   }
 }
 
+// Human-friendly tool-card labels. `count` distinguishes a single invocation
+// from a cluster (e.g. one "Command" vs "Running commands").
+function toolDisplayLabel(verb: string, count: number): string {
+  if (verb === "Ran") return count > 1 ? "Running commands" : "Command";
+  return verb;
+}
+
 function renderToolCallMessage(
   rendering: ConversationRenderingOptions,
   toolCall: ParsedToolCallMessage,
@@ -1055,16 +1062,12 @@ function renderToolCallMessage(
   toolExecution: ApiSessionSnapshot["toolExecutions"][number] | undefined = undefined,
 ) {
   const status = getToolActivityState(toolExecution, resultMessages);
-  const { summary } = formatToolCallSummary(toolCall.toolName, toolCall.arguments);
-  const resultPreview = resultMessages
-    .map((resultMessage) => summarizeToolExecutionPreview(resultMessage.text))
-    .find((preview): preview is string => Boolean(preview))
-    ?? (toolExecution?.text ? summarizeToolExecutionPreview(toolExecution.text) : undefined);
+  const { verb, summary } = formatToolCallSummary(toolCall.toolName, toolCall.arguments);
 
   return renderToolActivityCard(rendering, {
     cardKey,
-    title: toolCall.toolName,
-    preview: resultPreview ?? summary,
+    title: toolDisplayLabel(verb, 1),
+    preview: summary,
     status,
     variant: "inline",
     secondaryLabel: undefined,
@@ -1116,7 +1119,51 @@ type ToolCallGroupEntry = {
   cardKey: string;
   summary: string;
   status: ToolActivityState;
+  verb: string;
 };
+
+// Renders one run of same-verb tool calls: a single call as a card, multiple as
+// a grouped list. Shared by in-message and cross-message grouping.
+function renderToolRun(
+  rendering: ConversationRenderingOptions,
+  verb: string,
+  entries: ToolCallGroupEntry[],
+): ReturnType<typeof html> {
+  return entries.length === 1
+    ? renderToolCallMessage(
+        rendering,
+        entries[0]!.toolCall,
+        entries[0]!.cardKey,
+        entries[0]!.resultMessages,
+        entries[0]!.toolExecution,
+      )
+    : renderToolCallGroup(rendering, verb, entries);
+}
+
+// Splits a flat sequence of tool-call entries into same-verb runs and renders
+// each. Used to collapse consecutive tool-only assistant turns into compact
+// grouped lists instead of one full card per call.
+function renderToolCallEntries(
+  rendering: ConversationRenderingOptions,
+  entries: ToolCallGroupEntry[],
+): ReturnType<typeof html>[] {
+  const blocks: ReturnType<typeof html>[] = [];
+  let runVerb: string | undefined;
+  let run: ToolCallGroupEntry[] = [];
+  const flush = () => {
+    if (run.length === 0) return;
+    blocks.push(renderToolRun(rendering, runVerb ?? "", run));
+    run = [];
+    runVerb = undefined;
+  };
+  for (const entry of entries) {
+    if (runVerb !== undefined && runVerb !== entry.verb) flush();
+    runVerb = entry.verb;
+    run.push(entry);
+  }
+  flush();
+  return blocks;
+}
 
 function aggregateToolGroupStatus(entries: ToolCallGroupEntry[]): ToolActivityState {
   if (entries.some((entry) => entry.status === "error")) return "error";
@@ -1129,11 +1176,12 @@ function aggregateToolGroupStatus(entries: ToolCallGroupEntry[]): ToolActivitySt
 // listing each invocation as an expandable bullet (e.g. one "Read" + N files).
 function renderToolCallGroup(rendering: ConversationRenderingOptions, verb: string, entries: ToolCallGroupEntry[]) {
   const status = aggregateToolGroupStatus(entries);
+  const groupName = toolDisplayLabel(verb, entries.length);
   return html`
     <div class="pp-tool-group pp-tool-group-${status} pp-content-block">
       <div class="pp-tool-group-head">
         <span class="pp-tool-connector ${status}" aria-hidden="true">\u2514</span>
-        <span class="pp-tool-name">${verb}</span>
+        <span class="pp-tool-name">${groupName}</span>
         <span class="pp-tool-group-count">${entries.length}</span>
       </div>
       <ul class="pp-tool-group-list">
@@ -1328,6 +1376,16 @@ export function renderConversation(
   const consumedToolExecutionIds = new Set<string>();
   const messageActionContexts = getMessageActionContexts(rendering.actionContextMessages);
 
+  // Consecutive tool-only assistant turns are accumulated here and flushed as
+  // verb-grouped clusters, so a long stretch of individual read/bash/write
+  // calls collapses into compact lists instead of one full card per call.
+  let pendingToolEntries: ToolCallGroupEntry[] = [];
+  const flushPendingTools = () => {
+    if (pendingToolEntries.length === 0) return;
+    grouped.push(...renderToolCallEntries(rendering, pendingToolEntries));
+    pendingToolEntries = [];
+  };
+
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
     if (!message) continue;
@@ -1385,12 +1443,48 @@ export function renderConversation(
         if (toolExecution) consumedToolExecutionIds.add(toolExecution.toolCallId);
       }
 
+      const hasMarkdown = parts.some((part) => part.type === "markdown");
+
+      // Tool-only turn: accumulate its calls so they cluster with adjacent
+      // tool-only turns instead of each rendering as a separate card.
+      if (toolCallParts.length > 0 && !hasMarkdown) {
+        let toolCallIndex = 0;
+        for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
+          const part = parts[partIndex]!;
+          if (part.type !== "toolCall") continue;
+          const entryIndex = toolCallIndex++;
+          const resultMessages = groupedToolResults[entryIndex] ?? [];
+          const toolExecution = toolExecutionMatches[entryIndex];
+          const { verb, summary } = formatToolCallSummary(part.toolCall.toolName, part.toolCall.arguments);
+          pendingToolEntries.push({
+            toolCall: part.toolCall,
+            resultMessages,
+            toolExecution,
+            cardKey: getToolCardKey(rendering, "message", message.id, "tool-call", String(partIndex)),
+            summary,
+            status: getToolActivityState(toolExecution, resultMessages),
+            verb,
+          });
+        }
+        continue;
+      }
+
+      // Reasoning-only / empty turn: render nothing and keep the cluster intact.
+      if (toolCallParts.length === 0 && !hasMarkdown) {
+        continue;
+      }
+
+      // Turn contains text: end any pending cluster, then render normally.
+      flushPendingTools();
       grouped.push(renderMessage(rendering, message, messageActionContexts.get(message.id), groupedToolResults, toolExecutionMatches, parts));
       continue;
     }
 
+    flushPendingTools();
     grouped.push(renderMessage(rendering, message, messageActionContexts.get(message.id)));
   }
+
+  flushPendingTools();
 
   return {
     entries: grouped,
@@ -1432,19 +1526,7 @@ function renderMessage(
 
     const flushRun = () => {
       if (run.length === 0) return;
-      const entries = run;
-      const verb = runVerb ?? "";
-      blocks.push(
-        entries.length === 1
-          ? renderToolCallMessage(
-              rendering,
-              entries[0]!.toolCall,
-              entries[0]!.cardKey,
-              entries[0]!.resultMessages,
-              entries[0]!.toolExecution,
-            )
-          : renderToolCallGroup(rendering, verb, entries),
-      );
+      blocks.push(renderToolRun(rendering, runVerb ?? "", run));
       run = [];
       runVerb = undefined;
     };
@@ -1466,26 +1548,17 @@ function renderMessage(
           cardKey: getToolCardKey(rendering, "message", message.id, "tool-call", String(partIndex)),
           summary,
           status,
+          verb,
         });
         continue;
       }
 
       if (part.type === "thinking") {
-        flushRun();
-        blocks.push(
-          renderMessageRow(
-            "assistant",
-            html`
-              <details class="pp-thinking">
-                <summary class="pp-thinking-summary">
-                  <span class="pp-thinking-label">Thinking</span>
-                  <span class="pp-thinking-disclosure" aria-hidden="true"></span>
-                </summary>
-                <pre class="pp-thinking-content">${part.text}</pre>
-              </details>
-            `,
-          ),
-        );
+        // Reasoning is never shown inline in the chat; the live "Thinking…"
+        // state is surfaced in the status/activity area instead. Skipping
+        // without flushing the run also lets consecutive same-verb tool calls
+        // (e.g. several Reads) collapse into a single list even when the model
+        // interleaves reasoning between them.
         continue;
       }
 
