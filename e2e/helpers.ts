@@ -41,7 +41,9 @@ export async function openApp(
   const expectedMessageCount = options.expectedMessageCount ?? 7;
 
   await page.goto("/", { waitUntil: "domcontentloaded" });
-  await expect(page.getByText("Pi Web")).toBeVisible();
+  // The "Pi Web" wordmark is hidden on mobile widths once a session title
+  // shows, so gate on the always-present header instead.
+  await expect(page.locator(".pp-header")).toBeVisible();
 
   if (options.expectedSessionCount !== undefined) {
     await expect(sessionItems(page)).toHaveCount(options.expectedSessionCount);
@@ -49,12 +51,40 @@ export async function openApp(
     await expect(sessionItems(page).first()).toBeVisible();
   }
 
-  const heading = activeConversation(page).getByRole("heading", { name: expectedTitle });
-  if (!(await heading.isVisible().catch(() => false))) {
+  if (!(await isActiveSession(page, expectedTitle))) {
+    // On mobile widths the sidebar is a closed overlay, so open it before
+    // picking the session; selecting one auto-closes the overlay again.
+    const expandButton = page.getByRole("button", { name: "Expand sidebar" });
+    if (await expandButton.isVisible().catch(() => false)) {
+      await expandButton.click();
+    }
     await sessionItem(page, expectedTitle, expectedMessageCount).click();
   }
 
-  await expect(heading).toBeVisible();
+  await expectActiveSession(page, expectedTitle);
+}
+
+// The active session title lives in the sub-header on desktop and moves into
+// the top bar on phones, so the readiness check has to look at both spots.
+function activeSessionHeading(page: Page): Locator {
+  return activeConversation(page).getByRole("heading");
+}
+
+async function isActiveSession(page: Page, title: string): Promise<boolean> {
+  const headerTitle = page.locator(".pp-header-session-title");
+  if (await headerTitle.isVisible().catch(() => false)) {
+    return (await headerTitle.textContent().catch(() => null))?.trim() === title;
+  }
+  return activeSessionHeading(page).filter({ hasText: title }).isVisible().catch(() => false);
+}
+
+export async function expectActiveSession(page: Page, title: string) {
+  const headerTitle = page.locator(".pp-header-session-title");
+  if (await headerTitle.isVisible().catch(() => false)) {
+    await expect(headerTitle).toHaveText(title);
+    return;
+  }
+  await expect(activeConversation(page).getByRole("heading", { name: title })).toBeVisible();
 }
 
 export async function closeMenu(page: Page) {

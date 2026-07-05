@@ -2418,12 +2418,14 @@ const template = () => {
 
         ${extensionUi.renderWidgets("belowEditor")}
 
-        ${extensionUi.hasFooter()
-          ? extensionUi.renderFooter()
-          : html`
-              <!-- Status bar -->
-              <div class="pp-statusbar">
-                <div class="pp-statusbar-meta">
+        ${extensionUi.hasFooter() ? extensionUi.renderFooter() : nothing}
+
+        <!-- Status bar -->
+        <div class="pp-statusbar">
+          <div class="pp-statusbar-meta">
+            ${extensionUi.hasFooter()
+              ? nothing
+              : html`
                   ${workspaceLabel
                     ? html`<span class="pp-statusbar-detail" title=${sessionCwd}>${workspaceLabel}</span>`
                     : nothing}
@@ -2435,23 +2437,23 @@ const template = () => {
                         >${contextUsageLabel}</span>
                       `
                     : nothing}
-                </div>
-                <div class="pp-statusbar-actions">
-                  ${extensionUi.renderStatuses()}
-                  <button class="pp-statusbar-model" @click=${openModelsDialog}>
-                    ${activeSessionModelLabel}
-                  </button>
-                  <button
-                    class="pp-statusbar-model"
-                    @click=${openThinkingLevelsDialog}
-                    title="Select thinking level"
-                    aria-label=${`Thinking level: ${formatThinkingLevel(state.activeSession?.thinkingLevel)}`}
-                  >
-                    \ud83d\udca1 ${formatThinkingLevel(state.activeSession?.thinkingLevel)}
-                  </button>
-                </div>
-              </div>
-            `}
+                `}
+          </div>
+          <div class="pp-statusbar-actions">
+            ${extensionUi.hasFooter() ? nothing : extensionUi.renderStatuses()}
+            <button class="pp-statusbar-model" @click=${openModelsDialog}>
+              ${activeSessionModelLabel}
+            </button>
+            <button
+              class="pp-statusbar-model"
+              @click=${openThinkingLevelsDialog}
+              title="Select thinking level"
+              aria-label=${`Thinking level: ${formatThinkingLevel(state.activeSession?.thinkingLevel)}`}
+            >
+              \ud83d\udca1 ${formatThinkingLevel(state.activeSession?.thinkingLevel)}
+            </button>
+          </div>
+        </div>
       </main>
     </div>
 

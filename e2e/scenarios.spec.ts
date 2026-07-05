@@ -7,6 +7,7 @@ import {
   chooseMenuItem,
   composer,
   EDIT_FORK_PROMPT,
+  expectActiveSession,
   openApp,
   PRIMARY_SESSION_TITLE,
   SECONDARY_SESSION_TITLE,
@@ -76,14 +77,10 @@ test.describe.serial("broad real-interaction scenarios", () => {
       .filter({ hasText: "Fixture session ready for Playwright." })
       .first();
 
-    const thinkingBlock = page.locator(".pp-thinking").filter({ hasText: "Inspecting the fixture session." }).first();
-    await expect(thinkingBlock).toBeVisible();
-    await expect(thinkingBlock).not.toHaveAttribute("open", "");
-    await expect(thinkingBlock.locator(".pp-thinking-label")).toHaveText("Thinking");
-    await expect(thinkingBlock.locator(".pp-thinking-content")).toBeHidden();
-    await thinkingBlock.locator("summary").click();
-    await expect(thinkingBlock).toHaveAttribute("open", "");
-    await expect(thinkingBlock.locator(".pp-thinking-content")).toContainText("Preparing markdown, diff, and tool activity examples for the UI.");
+    // Reasoning is never surfaced inline in the conversation; it is only shown
+    // as the live "Thinking…" activity state while the agent is streaming.
+    await expect(page.locator(".pp-thinking")).toHaveCount(0);
+    await expect(activeConversation(page)).not.toContainText("Inspecting the fixture session.");
 
     const typeScriptBlock = primaryAssistantMessage
       .locator(".pp-code-block")
@@ -121,29 +118,30 @@ test.describe.serial("broad real-interaction scenarios", () => {
     await expect(diffBlock).toContainText("+console.log(mode);");
     await expect(diffBlock.locator(".pp-diff-line-hunk")).toContainText("@@ -1,2 +1,3 @@");
 
-    const successfulTool = toolCard(page, "bash");
+    const successfulTool = toolCard(page, "Command");
     await expect(successfulTool).toBeVisible();
     await expect(successfulTool).not.toHaveAttribute("open", "");
     await expect(successfulTool.locator(".pp-tool-status.done")).toHaveText("Done");
-    await expect(successfulTool.locator(".pp-tool-preview")).toContainText("app.css");
+    await expect(successfulTool.locator(".pp-tool-preview")).toContainText("ls -1 client/src");
 
     const failedTool = toolCard(page, "read_file");
     await expect(failedTool).toBeVisible();
     await expect(failedTool).not.toHaveAttribute("open", "");
     await expect(failedTool.locator(".pp-tool-status.error")).toHaveText("Failed");
-    await expect(failedTool.locator(".pp-tool-preview")).toContainText("permission denied");
+    await expect(failedTool.locator(".pp-tool-preview")).toContainText("client/src/main.ts");
 
-    const successfulReadTool = toolCard(page, "read");
+    const successfulReadTool = toolCard(page, "Read");
     await expect(successfulReadTool).toBeVisible();
     await expect(successfulReadTool).not.toHaveAttribute("open", "");
     await expect(successfulReadTool.locator(".pp-tool-status.done")).toHaveText("Done");
-    await expect(successfulReadTool.locator(".pp-tool-preview")).toContainText('export type SessionStatus = "idle" | "streaming" | "error";');
+    await expect(successfulReadTool.locator(".pp-tool-preview")).toContainText("shared/src/index.ts");
 
     await expect(page.locator(".pp-tool-card[open]")).toHaveCount(0);
 
     await failedTool.locator("summary").click();
     await expect(failedTool).toHaveAttribute("open", "");
     await expect(failedTool.locator(".pp-tool-section-label").filter({ hasText: "Error" })).toBeVisible();
+    await expect(failedTool.locator(".pp-tool-section-result")).toContainText("permission denied");
 
     const sessionsResponse = await request.get("/api/sessions?scope=all");
     await expect(sessionsResponse).toBeOK();
@@ -157,6 +155,7 @@ test.describe.serial("broad real-interaction scenarios", () => {
     await successfulReadTool.locator("summary").click();
     await expect(successfulReadTool).toHaveAttribute("open", "");
     await expect(successfulReadTool.locator(".pp-tool-section-label").filter({ hasText: "Result" })).toBeVisible();
+    await expect(successfulReadTool.locator(".pp-tool-section-result")).toContainText('export type SessionStatus = "idle" | "streaming" | "error";');
 
     await chooseMenuItem(page, "Default");
     await expect(html).toHaveAttribute("data-display-mode", "default");
@@ -216,7 +215,7 @@ test.describe.serial("broad real-interaction scenarios", () => {
       await sessionItem(page, ARCHIVE_SESSION_TITLE, 2).click();
 
       await expect(body).toHaveClass(/sidebar-closed/);
-      await expect(activeConversation(page).getByRole("heading", { name: ARCHIVE_SESSION_TITLE })).toBeVisible();
+      await expectActiveSession(page, ARCHIVE_SESSION_TITLE);
       await expect(composer(page)).toHaveValue("");
 
       await page.getByRole("button", { name: "Expand sidebar" }).click();
@@ -224,7 +223,7 @@ test.describe.serial("broad real-interaction scenarios", () => {
       await sessionItem(page, SECONDARY_SESSION_TITLE, 2).click();
 
       await expect(body).toHaveClass(/sidebar-closed/);
-      await expect(activeConversation(page).getByRole("heading", { name: SECONDARY_SESSION_TITLE })).toBeVisible();
+      await expectActiveSession(page, SECONDARY_SESSION_TITLE);
       await expect(composer(page)).toHaveValue("");
     });
   });
@@ -251,6 +250,8 @@ test.describe.serial("broad real-interaction scenarios", () => {
     await expect(page.locator("text=Legacy string widget content")).toBeVisible();
     await expect(page.locator("text=below-widget")).toBeVisible();
     await expect(page.locator(".pp-statusbar")).toContainText("fixture-ui: Extension status ready");
+    await expect(page.locator(".pp-extension-surface-footer")).toContainText("fixture-footer: extension status line");
+    await expect(page.locator(".pp-statusbar-model").first()).toBeVisible();
     await expect(composerInput).toHaveValue("Composer text set from /fixture-ui");
     await expect(page).toHaveTitle("Fixture extension title");
     await expect(page.locator("text=broken-widget")).toHaveCount(0);
@@ -258,7 +259,8 @@ test.describe.serial("broad real-interaction scenarios", () => {
 
     await messageRow.scrollIntoViewIfNeeded();
     await messageRow.hover();
-    await messageRow.getByRole("button", { name: "Edit prompt from here" }).click({ force: true });
+    await messageRow.locator(".pp-message-actions-toggle").click();
+    await messageRow.getByRole("button", { name: "Edit prompt from here" }).click();
     await expect(page.locator(".pp-info")).toContainText("Edit opened a safe fork");
     await expect(composerInput).toHaveValue(EDIT_FORK_PROMPT);
     await expect(composerInput).toBeFocused();
@@ -270,7 +272,8 @@ test.describe.serial("broad real-interaction scenarios", () => {
     const originalMessageRow = toolMessageRow(page);
     await originalMessageRow.scrollIntoViewIfNeeded();
     await originalMessageRow.hover();
-    await originalMessageRow.getByRole("button", { name: "Fork from here" }).click({ force: true });
+    await originalMessageRow.locator(".pp-message-actions-toggle").click();
+    await originalMessageRow.getByRole("button", { name: "Fork from here" }).click();
     await expect(page.locator(".pp-info")).toContainText("Fork created");
     await expect(composerInput).toHaveValue(EDIT_FORK_PROMPT);
     await expect(sessionItems(page)).toHaveCount(initialSessionCount + 2);
